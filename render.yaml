@@ -1,6 +1,6 @@
 services:
 - type: web
-  repo: https://github.com/biplap12/nepalstock-api.git
+  repo: https://github.com/aaagammmingg/nepalstock-api.git
   name: nepalstock-api
   plan: free
   branch: main
