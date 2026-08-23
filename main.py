@@ -652,7 +652,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     self.response({"success": False, "error": "page and size must be integers"}, 400)
                     return
-                if page < 0 or size < 1 or size > 100:
+                if page < 0 or size < 1 or size > 500:
                     self.response({"success": False, "error": "invalid page or size"}, 400)
                     return
 
