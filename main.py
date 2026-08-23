@@ -2538,14 +2538,11 @@
 #     main()
 
 
-
-
-
-
 import datetime as dt
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -2579,6 +2576,9 @@ NEPSE_PAGE_SIZE = 100
 # Safety limit so a broken NEPSE pagination response
 # cannot create an infinite loop.
 MAX_STOCK_PAGES = 100
+
+# Cache TTL for the full stock list (seconds)
+STOCK_CACHE_TTL = 60
 
 
 # ============================================================
@@ -3025,6 +3025,11 @@ class Nepse:
         self.payload_id = None
 
         self.lock = threading.RLock()
+
+        # Cache for the full stock list (thread‑safe)
+        self._stock_cache = None          # list of stock dicts
+        self._stock_cache_time = None     # timestamp (seconds since epoch)
+        self._cache_lock = threading.RLock()
 
     # ========================================================
     # AUTHENTICATION
@@ -3502,25 +3507,38 @@ class Nepse:
         return data
 
     # ========================================================
-    # FETCH ALL STOCKS
+    # FETCH ALL STOCKS (with caching)
     # ========================================================
 
     def get_all_stocks(
         self,
         page_size=NEPSE_PAGE_SIZE,
+        force_refresh=False,
     ):
         """
-        Fetch every page from NEPSE and return
-        one combined list.
+        Fetch every page from NEPSE and return one combined list,
+        with thread‑safe caching.
 
         This is the important part for search.
 
-        Search MUST NOT be performed against
-        only page 0.
+        Search MUST NOT be performed against only page 0.
         """
 
-        all_stocks = []
+        # Check cache first
+        with self._cache_lock:
+            now = time.time()
+            if (
+                not force_refresh
+                and self._stock_cache is not None
+                and self._stock_cache_time is not None
+                and (now - self._stock_cache_time) < STOCK_CACHE_TTL
+            ):
+                print("Using cached stock list")
+                return self._stock_cache
 
+        # Cache miss or expired – fetch all pages
+        all_stocks = []
+        stock_map = {}          # deduplicate by symbol
         page = 0
 
         while page < MAX_STOCK_PAGES:
@@ -3540,12 +3558,16 @@ class Nepse:
                 [],
             )
 
-            all_stocks.extend(content)
+            # Add stocks to map (deduplicate by symbol)
+            for stock in content:
+                symbol = stock.get("symbol")
+                if symbol:
+                    stock_map[symbol] = stock
+                else:
+                    # If no symbol, keep it anyway (fallback)
+                    all_stocks.append(stock)
 
-            # ------------------------------------------------
             # Determine pagination information
-            # ------------------------------------------------
-
             total_pages = safe_int(
                 data.get("totalPages")
             )
@@ -3566,11 +3588,7 @@ class Nepse:
                 f"{len(content)} stocks"
             )
 
-            # ------------------------------------------------
-            # Best case:
-            # NEPSE tells us totalPages.
-            # ------------------------------------------------
-
+            # Best case: NEPSE tells us totalPages.
             if (
                 total_pages is not None
                 and total_pages > 0
@@ -3585,24 +3603,16 @@ class Nepse:
                 page += 1
                 continue
 
-            # ------------------------------------------------
-            # If totalElements is available,
-            # stop when we have enough.
-            # ------------------------------------------------
-
+            # If totalElements is available, stop when we have enough.
             if (
                 total_elements is not None
-                and len(all_stocks)
+                and len(stock_map) + len(all_stocks)
                 >= total_elements
             ):
                 break
 
-            # ------------------------------------------------
-            # Fallback:
-            # if returned records are fewer than
-            # requested page size, we reached the end.
-            # ------------------------------------------------
-
+            # Fallback: if returned records are fewer than requested page size,
+            # we reached the end.
             if len(content) < page_size:
                 break
 
@@ -3619,12 +3629,20 @@ class Nepse:
                 "limit reached."
             )
 
+        # Combine deduplicated stocks and any without symbol
+        final_stocks = list(stock_map.values()) + all_stocks
+
         print(
-            f"Fetched {len(all_stocks)} "
-            f"stocks from NEPSE."
+            f"Fetched {len(final_stocks)} "
+            f"stocks from NEPSE (after dedup)."
         )
 
-        return all_stocks
+        # Update cache
+        with self._cache_lock:
+            self._stock_cache = final_stocks
+            self._stock_cache_time = time.time()
+
+        return final_stocks
 
 
 # ============================================================
@@ -3889,7 +3907,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 # ------------------------------------------------
                 # IMPORTANT:
-                # Fetch ALL NEPSE pages.
+                # Fetch ALL NEPSE pages (cached).
                 # ------------------------------------------------
 
                 all_stocks = (
@@ -4128,7 +4146,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 # ------------------------------------------------
                 # FILTER:
-                # fetch ALL pages first.
+                # fetch ALL pages first (cached).
                 # ------------------------------------------------
 
                 all_stocks = (
@@ -4776,5 +4794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
