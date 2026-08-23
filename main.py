@@ -2540,3 +2540,2219 @@
 
 
 
+import datetime as dt
+import json
+import os
+import threading
+import time
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlparse
+
+import pywasm
+import pytz
+import requests
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BASE_URL = "https://www.nepalstock.com.np"
+NEPSE_API = f"{BASE_URL}/api/nots"
+API_URL = "https://nepalstock-api-qycd.onrender.com"
+
+PORT = int(os.getenv("PORT", "5000"))
+
+TZ_NP = pytz.timezone("Asia/Kathmandu")
+
+BASE_DIR = Path(__file__).resolve().parent
+WASM_FILE = BASE_DIR / "css.wasm"
+
+REQUEST_TIMEOUT = (10, 30)
+
+# Number of stocks requested from NEPSE per upstream page.
+# 100 means 344 stocks normally require only 4 requests.
+UPSTREAM_PAGE_SIZE = 100
+
+# Search cache lifetime.
+# This prevents every search request from making 4+ NEPSE calls.
+SEARCH_CACHE_SECONDS = 30
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/128.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": BASE_URL + "/",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_np():
+    return dt.datetime.now(TZ_NP)
+
+
+def json_or_raw(text):
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return {"raw": text}
+
+
+def first_present(mapping, *keys):
+    """
+    Return the first value whose key exists and whose value
+    is not None.
+
+    Unlike `a or b`, this preserves valid values such as 0.
+    """
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+
+    return None
+
+
+def normalize_stock(stock):
+    """
+    Convert NEPSE stock response into the public API format.
+    """
+    if not isinstance(stock, dict):
+        return stock
+
+    return {
+        "symbol": first_present(
+            stock,
+            "symbol",
+        ),
+
+        "securityName": first_present(
+            stock,
+            "securityName",
+            "companyName",
+            "securityNameNepali",
+        ),
+
+        "ltp": first_present(
+            stock,
+            "lastTradedPrice",
+            "ltp",
+            "closePrice",
+            "closingPrice",
+        ),
+
+        "open": first_present(
+            stock,
+            "openPrice",
+            "open",
+        ),
+
+        "high": first_present(
+            stock,
+            "highPrice",
+            "high",
+        ),
+
+        "low": first_present(
+            stock,
+            "lowPrice",
+            "low",
+        ),
+
+        "previousClose": first_present(
+            stock,
+            "previousClose",
+            "previousClosingPrice",
+            "previousClosePrice",
+        ),
+
+        "change": first_present(
+            stock,
+            "change",
+            "difference",
+        ),
+
+        "percentageChange": first_present(
+            stock,
+            "percentageChange",
+            "percentChange",
+        ),
+
+        "volume": first_present(
+            stock,
+            "totalTradeQuantity",
+            "volume",
+        ),
+
+        "turnover": first_present(
+            stock,
+            "totalTradeValue",
+            "turnover",
+        ),
+
+        "trades": first_present(
+            stock,
+            "totalTrades",
+            "numberOfTrades",
+        ),
+
+        "timestamp": now_np().isoformat(),
+    }
+
+
+def stock_matches_query(stock, query):
+    """
+    Search BOTH symbol and securityName.
+
+    Example:
+        ACLBSL
+        bank
+        agricultural
+        aarambha
+    """
+
+    query = str(query or "").strip().lower()
+
+    if not query:
+        return False
+
+    symbol = str(
+        first_present(
+            stock,
+            "symbol",
+        ) or ""
+    ).lower()
+
+    security_name = str(
+        first_present(
+            stock,
+            "securityName",
+            "companyName",
+            "securityNameNepali",
+        ) or ""
+    ).lower()
+
+    return (
+        query in symbol
+        or query in security_name
+    )
+
+
+# ============================================================
+# TOKEN PARSER
+# ============================================================
+
+class TokenParser:
+
+    def __init__(self, wasm_file=WASM_FILE):
+
+        wasm_file = Path(wasm_file)
+
+        if not wasm_file.is_file():
+            raise FileNotFoundError(
+                f"WASM file not found: {wasm_file}"
+            )
+
+        self.runtime = pywasm.core.Runtime()
+
+        self.wasm_module = (
+            self.runtime.instance_from_file(
+                str(wasm_file)
+            )
+        )
+
+    def invoke(self, function_name, args):
+
+        result = self.runtime.invocate(
+            self.wasm_module,
+            function_name,
+            args,
+        )
+
+        if not result:
+            raise RuntimeError(
+                f"WASM function returned no value: "
+                f"{function_name}"
+            )
+
+        return int(result[0])
+
+    @staticmethod
+    def remove_indexes(token, indexes, token_name):
+
+        if not isinstance(token, str):
+            raise TypeError(
+                f"{token_name} must be a string"
+            )
+
+        if len(indexes) != 5:
+            raise ValueError(
+                f"{token_name}: expected 5 indexes"
+            )
+
+        if any(
+            i < 0 or i >= len(token)
+            for i in indexes
+        ):
+            raise ValueError(
+                f"{token_name}: WASM produced an invalid "
+                f"token index. token length={len(token)}, "
+                f"indexes={indexes}"
+            )
+
+        if len(set(indexes)) != len(indexes):
+            raise ValueError(
+                f"{token_name}: duplicate token indexes: "
+                f"{indexes}"
+            )
+
+        chars = list(token)
+
+        for index in sorted(indexes, reverse=True):
+            del chars[index]
+
+        return "".join(chars)
+
+    def parse_token_response(self, token):
+
+        required = [
+            "salt1",
+            "salt2",
+            "salt3",
+            "salt4",
+            "salt5",
+            "accessToken",
+            "refreshToken",
+        ]
+
+        missing = [
+            key
+            for key in required
+            if key not in token
+        ]
+
+        if missing:
+            raise ValueError(
+                "Authentication response is missing: "
+                + ", ".join(missing)
+            )
+
+        s1 = int(token["salt1"])
+        s2 = int(token["salt2"])
+        s3 = int(token["salt3"])
+        s4 = int(token["salt4"])
+        s5 = int(token["salt5"])
+
+        access_token = token["accessToken"]
+        refresh_token = token["refreshToken"]
+
+        # ----------------------------------------------------
+        # ACCESS TOKEN
+        # ----------------------------------------------------
+
+        access_indexes = [
+            self.invoke(
+                "cdx",
+                [s1, s2, s3, s4, s5],
+            ),
+
+            self.invoke(
+                "rdx",
+                [s1, s2, s4, s3, s5],
+            ),
+
+            self.invoke(
+                "bdx",
+                [s1, s2, s4, s3, s5],
+            ),
+
+            self.invoke(
+                "ndx",
+                [s1, s2, s4, s3, s5],
+            ),
+
+            self.invoke(
+                "mdx",
+                [s1, s2, s4, s3, s5],
+            ),
+        ]
+
+        parsed_access_token = self.remove_indexes(
+            access_token,
+            access_indexes,
+            "accessToken",
+        )
+
+        # ----------------------------------------------------
+        # REFRESH TOKEN
+        # ----------------------------------------------------
+
+        refresh_indexes = [
+            self.invoke(
+                "cdx",
+                [s2, s1, s3, s5, s4],
+            ),
+
+            self.invoke(
+                "rdx",
+                [s2, s1, s3, s4, s5],
+            ),
+
+            self.invoke(
+                "bdx",
+                [s2, s1, s4, s3, s5],
+            ),
+
+            self.invoke(
+                "ndx",
+                [s2, s1, s4, s3, s5],
+            ),
+
+            self.invoke(
+                "mdx",
+                [s2, s1, s4, s3, s5],
+            ),
+        ]
+
+        parsed_refresh_token = self.remove_indexes(
+            refresh_token,
+            refresh_indexes,
+            "refreshToken",
+        )
+
+        return (
+            parsed_access_token,
+            parsed_refresh_token,
+        )
+
+
+# ============================================================
+# NEPSE CLIENT
+# ============================================================
+
+class Nepse:
+
+    def __init__(self):
+
+        self.token_parser = TokenParser()
+
+        self.access_token = None
+        self.refresh_token = None
+
+        self.salts = []
+
+        self.payload_date = None
+        self.payload_id = None
+
+        self.lock = threading.RLock()
+
+        # ----------------------------------------------------
+        # SEARCH CACHE
+        # ----------------------------------------------------
+
+        self.stock_cache = None
+        self.stock_cache_time = 0
+
+        self.stock_cache_lock = threading.RLock()
+
+    # ========================================================
+    # AUTHENTICATION
+    # ========================================================
+
+    def authenticate(self):
+
+        print("Authenticating with NEPSE...")
+
+        response = session.get(
+            f"{BASE_URL}/api/authenticate/prove",
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        token_response = response.json()
+
+        salts = []
+
+        for i in range(1, 6):
+
+            key = f"salt{i}"
+
+            if key not in token_response:
+                raise RuntimeError(
+                    f"NEPSE authentication response "
+                    f"missing {key}"
+                )
+
+            value = int(token_response[key])
+
+            token_response[key] = value
+            salts.append(value)
+
+        access_token, refresh_token = (
+            self.token_parser.parse_token_response(
+                token_response
+            )
+        )
+
+        if not access_token:
+            raise RuntimeError(
+                "NEPSE returned an empty access token"
+            )
+
+        with self.lock:
+            self.salts = salts
+            self.access_token = access_token
+            self.refresh_token = refresh_token
+
+        print("NEPSE authentication successful.")
+
+    def get_token(self):
+
+        with self.lock:
+
+            if not self.access_token:
+                self.authenticate()
+
+            return (
+                self.access_token,
+                self.refresh_token,
+            )
+
+    def reset_token(self):
+
+        with self.lock:
+            self.access_token = None
+            self.refresh_token = None
+            self.salts = []
+
+    # ========================================================
+    # HEADERS
+    # ========================================================
+
+    def get_headers(self):
+
+        access_token, _ = self.get_token()
+
+        return {
+            **session.headers,
+            "Authorization": f"Salter {access_token}",
+        }
+
+    # ========================================================
+    # URL
+    # ========================================================
+
+    @staticmethod
+    def build_url(path):
+
+        path = "/" + path.lstrip("/")
+
+        return f"{NEPSE_API}{path}"
+
+    # ========================================================
+    # GET
+    # ========================================================
+
+    def get(self, path):
+
+        url = self.build_url(path)
+
+        response = session.get(
+            url,
+            headers=self.get_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 401:
+            return (
+                response.text,
+                response.status_code,
+            )
+
+        print(
+            "Token expired. Re-authenticating..."
+        )
+
+        self.reset_token()
+
+        response = session.get(
+            url,
+            headers=self.get_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        return (
+            response.text,
+            response.status_code,
+        )
+
+    # ========================================================
+    # DUMMY ID
+    # ========================================================
+
+    def get_dummy_id(self):
+
+        current_date = now_np().date()
+
+        with self.lock:
+
+            if (
+                self.payload_date == current_date
+                and self.payload_id is not None
+            ):
+                return self.payload_id
+
+        response, status = self.get(
+            "/nepse-data/market-open"
+        )
+
+        if status != 200:
+            raise RuntimeError(
+                f"Could not get market-open. "
+                f"HTTP {status}: {response[:500]}"
+            )
+
+        data = json.loads(response)
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "Unexpected market-open response"
+            )
+
+        if "id" not in data:
+            raise RuntimeError(
+                "market-open response does not contain id"
+            )
+
+        dummy_id = int(data["id"])
+
+        if dummy_id < 0:
+            raise RuntimeError(
+                f"Invalid NEPSE payload id: {dummy_id}"
+            )
+
+        with self.lock:
+            self.payload_id = dummy_id
+            self.payload_date = current_date
+
+        return dummy_id
+
+    # ========================================================
+    # PROTECTED PAYLOAD DATA
+    # ========================================================
+
+    @staticmethod
+    def get_dummy_data():
+
+        return [
+            147, 117, 239, 143, 157, 312, 161, 612,
+            512, 804, 411, 527, 170, 511, 421, 667,
+            764, 621, 301, 106, 133, 793, 411, 511,
+            312, 423, 344, 346, 653, 758, 342, 222,
+            236, 811, 711, 611, 122, 447, 128, 199,
+            183, 135, 489, 703, 800, 745, 152, 863,
+            134, 211, 142, 564, 375, 793, 212, 153,
+            138, 153, 648, 611, 151, 649, 318, 143,
+            117, 756, 119, 141, 717, 113, 112, 146,
+            162, 660, 693, 261, 362, 354, 251, 641,
+            157, 178, 631, 192, 734, 445, 192, 883,
+            187, 122, 591, 731, 852, 384, 565, 596,
+            451, 772, 624, 691,
+        ]
+
+    def _payload_base(self):
+
+        dummy_id = self.get_dummy_id()
+        data = self.get_dummy_data()
+
+        if dummy_id >= len(data):
+            raise RuntimeError(
+                f"NEPSE payload id {dummy_id} is outside "
+                f"the payload table "
+                f"(size={len(data)})"
+            )
+
+        now = now_np()
+
+        return (
+            data[dummy_id]
+            + dummy_id
+            + 2 * now.day
+        )
+
+    # ========================================================
+    # NORMAL POST PAYLOAD
+    # ========================================================
+
+    def get_post_payload_id(self):
+
+        return self._payload_base()
+
+    # ========================================================
+    # FLOORSHEET / TODAY PRICE PAYLOAD
+    # ========================================================
+
+    def get_floor_payload_id(self):
+
+        e = self._payload_base()
+
+        now = now_np()
+
+        with self.lock:
+
+            if len(self.salts) != 5:
+                raise RuntimeError(
+                    "NEPSE salts are not initialized"
+                )
+
+            salts = self.salts.copy()
+
+        salt_index = (
+            1
+            if e % 10 < 4
+            else 3
+        )
+
+        return (
+            e
+            + salts[salt_index] * now.day
+            - salts[salt_index - 1]
+        )
+
+    # ========================================================
+    # INDEX GRAPH PAYLOAD
+    # ========================================================
+
+    def get_index_payload_id(self):
+
+        e = self._payload_base()
+
+        now = now_np()
+
+        with self.lock:
+
+            if len(self.salts) != 5:
+                raise RuntimeError(
+                    "NEPSE salts are not initialized"
+                )
+
+            salts = self.salts.copy()
+
+        salt_index = (
+            3
+            if e % 10 < 5
+            else 1
+        )
+
+        return (
+            e
+            + salts[salt_index] * now.day
+            - salts[salt_index - 1]
+        )
+
+    # ========================================================
+    # POST
+    # ========================================================
+
+    def post(self, path, body=None):
+
+        url = self.build_url(path)
+
+        if body is None:
+
+            if (
+                "/nepse-data/floorsheet" in path
+                or "/nepse-data/today-price" in path
+            ):
+                payload_id = (
+                    self.get_floor_payload_id()
+                )
+
+            elif "/graph/index/" in path:
+
+                payload_id = (
+                    self.get_index_payload_id()
+                )
+
+            else:
+
+                payload_id = (
+                    self.get_post_payload_id()
+                )
+
+            body = {
+                "id": payload_id,
+            }
+
+        headers = {
+            **self.get_headers(),
+            "Content-Type": "application/json",
+        }
+
+        response = session.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code != 401:
+            return (
+                response.text,
+                response.status_code,
+            )
+
+        print(
+            "Token expired. Re-authenticating..."
+        )
+
+        self.reset_token()
+
+        headers = {
+            **self.get_headers(),
+            "Content-Type": "application/json",
+        }
+
+        response = session.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        return (
+            response.text,
+            response.status_code,
+        )
+
+    # ========================================================
+    # FETCH ONE STOCK PAGE
+    # ========================================================
+
+    def fetch_stock_page(
+        self,
+        page=0,
+        size=UPSTREAM_PAGE_SIZE,
+    ):
+        """
+        Fetch one page from NEPSE today-price.
+        """
+
+        payload_id = (
+            self.get_floor_payload_id()
+        )
+
+        body, status = self.post(
+            "/nepse-data/today-price",
+            {
+                "id": payload_id,
+                "page": page,
+                "size": size,
+            },
+        )
+
+        if status != 200:
+            raise RuntimeError(
+                f"today-price failed: "
+                f"HTTP {status}: {body[:500]}"
+            )
+
+        data = json_or_raw(body)
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "Unexpected today-price response"
+            )
+
+        content = data.get("content", [])
+
+        if not isinstance(content, list):
+            raise RuntimeError(
+                "today-price response has invalid content"
+            )
+
+        return data
+
+    # ========================================================
+    # FETCH ALL STOCKS
+    # ========================================================
+
+    def fetch_all_stocks(self, force=False):
+        """
+        Fetch ALL stocks from NEPSE.
+
+        This is the important part for /api/search.
+
+        We do NOT search only page 0.
+
+        We keep requesting pages until the NEPSE pagination
+        metadata says there are no more pages.
+        """
+
+        with self.stock_cache_lock:
+
+            current_time = time.time()
+
+            if (
+                not force
+                and self.stock_cache is not None
+                and (
+                    current_time
+                    - self.stock_cache_time
+                    < SEARCH_CACHE_SECONDS
+                )
+            ):
+                return self.stock_cache.copy()
+
+            print(
+                "Refreshing complete stock search cache..."
+            )
+
+            all_stocks = []
+
+            page = 0
+
+            while True:
+
+                print(
+                    f"Fetching stock page {page} "
+                    f"(size={UPSTREAM_PAGE_SIZE})..."
+                )
+
+                data = self.fetch_stock_page(
+                    page=page,
+                    size=UPSTREAM_PAGE_SIZE,
+                )
+
+                content = data.get(
+                    "content",
+                    [],
+                )
+
+                if not content:
+                    break
+
+                all_stocks.extend(content)
+
+                # ------------------------------------------------
+                # Read pagination metadata when available.
+                # ------------------------------------------------
+
+                total_pages = data.get(
+                    "totalPages"
+                )
+
+                last = data.get(
+                    "last"
+                )
+
+                number = data.get(
+                    "number",
+                    page,
+                )
+
+                response_size = data.get(
+                    "size",
+                    UPSTREAM_PAGE_SIZE,
+                )
+
+                total_elements = data.get(
+                    "totalElements"
+                )
+
+                print(
+                    f"Page {page}: "
+                    f"{len(content)} stocks"
+                )
+
+                # ------------------------------------------------
+                # Preferred stopping conditions
+                # ------------------------------------------------
+
+                if last is True:
+                    break
+
+                if (
+                    total_pages is not None
+                    and page + 1 >= int(total_pages)
+                ):
+                    break
+
+                # ------------------------------------------------
+                # If totalElements is available.
+                # ------------------------------------------------
+
+                if total_elements is not None:
+
+                    if (
+                        len(all_stocks)
+                        >= int(total_elements)
+                    ):
+                        break
+
+                # ------------------------------------------------
+                # Fallback:
+                # if returned page has fewer stocks than
+                # requested, this is almost certainly the
+                # final page.
+                # ------------------------------------------------
+
+                if len(content) < UPSTREAM_PAGE_SIZE:
+                    break
+
+                # ------------------------------------------------
+                # Safety:
+                # if API reports an unexpected page number,
+                # avoid looping forever.
+                # ------------------------------------------------
+
+                if (
+                    number is not None
+                    and int(number) != page
+                ):
+                    page = int(number) + 1
+                else:
+                    page += 1
+
+                # Absolute safety limit.
+                if page > 100:
+                    print(
+                        "Stopping stock pagination at safety "
+                        "limit."
+                    )
+                    break
+
+            # ----------------------------------------------------
+            # Remove duplicate stocks by symbol.
+            # ----------------------------------------------------
+
+            unique = {}
+            without_symbol = []
+
+            for stock in all_stocks:
+
+                if not isinstance(stock, dict):
+                    continue
+
+                symbol = first_present(
+                    stock,
+                    "symbol",
+                )
+
+                if symbol:
+
+                    symbol_key = str(
+                        symbol
+                    ).strip().upper()
+
+                    unique[symbol_key] = stock
+
+                else:
+
+                    without_symbol.append(
+                        stock
+                    )
+
+            all_stocks = (
+                list(unique.values())
+                + without_symbol
+            )
+
+            print(
+                f"Stock search cache refreshed: "
+                f"{len(all_stocks)} stocks"
+            )
+
+            self.stock_cache = all_stocks
+            self.stock_cache_time = time.time()
+
+            return all_stocks.copy()
+
+    # ========================================================
+    # SEARCH ALL STOCKS
+    # ========================================================
+
+    def search_stocks(self, query):
+        """
+        Search the COMPLETE stock universe.
+
+        This is deliberately separate from the upstream
+        pagination.
+
+        Example:
+
+            query = GRDBL
+
+        If GRDBL is on upstream page 3, it will still be found.
+        """
+
+        query = str(query or "").strip()
+
+        if not query:
+            return []
+
+        all_stocks = self.fetch_all_stocks()
+
+        matches = [
+            stock
+            for stock in all_stocks
+            if stock_matches_query(
+                stock,
+                query,
+            )
+        ]
+
+        return matches
+
+
+# ============================================================
+# SINGLE CLIENT
+# ============================================================
+
+nepse = Nepse()
+
+
+# ============================================================
+# HTTP HANDLER
+# ============================================================
+
+class Handler(BaseHTTPRequestHandler):
+
+    protocol_version = "HTTP/1.1"
+
+    # --------------------------------------------------------
+    # Reduce default server logging
+    # --------------------------------------------------------
+
+    def log_message(self, format, *args):
+
+        print(
+            "%s - %s"
+            % (
+                self.address_string(),
+                format % args,
+            )
+        )
+
+    # --------------------------------------------------------
+    # CORS
+    # --------------------------------------------------------
+
+    def cors(self):
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*",
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS",
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        )
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
+    def response(self, data, status=200):
+
+        payload = json.dumps(
+            data,
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8",
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(payload)),
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+
+        self.cors()
+
+        self.end_headers()
+
+        try:
+
+            self.wfile.write(
+                payload
+            )
+
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+        ):
+
+            pass
+
+    # --------------------------------------------------------
+    # OPTIONS
+    # --------------------------------------------------------
+
+    def do_OPTIONS(self):
+
+        self.send_response(204)
+
+        self.send_header(
+            "Content-Length",
+            "0",
+        )
+
+        self.cors()
+
+        self.end_headers()
+
+    # --------------------------------------------------------
+    # GET
+    # --------------------------------------------------------
+
+    def do_GET(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
+
+        query = parse_qs(
+            parsed.query
+        )
+
+        print(
+            "GET",
+            self.path
+        )
+
+        try:
+
+            # ==================================================
+            # HOME
+            # ==================================================
+
+            if path == "/":
+
+                self.response(
+                    {
+                        "name": "Open NEPSE API",
+                        "status": "running",
+                        "timezone": "Asia/Kathmandu",
+
+                        "endpoints": [
+                            "/api/stocks",
+                            "/api/stocks/SYMBOL",
+                            "/api/search?q=SYMBOL",
+                            "/api/market",
+                            "/api/index",
+                            "/api/status",
+                            "/api/gainers",
+                            "/api/losers",
+                            "/api/today-price",
+                            "/api/floorsheet",
+                        ],
+                    }
+                )
+
+                return
+
+            # ==================================================
+            # SEARCH
+            # ==================================================
+
+            if path == "/api/search":
+
+                # ------------------------------------------------
+                # Accept:
+                #
+                # /api/search?q=GRDBL
+                #
+                # Also accept:
+                #
+                # /api/search?query=GRDBL
+                #
+                # /api/search?symbol=GRDBL
+                #
+                # ------------------------------------------------
+
+                search_query = (
+                    query.get(
+                        "q",
+                        [""],
+                    )[0]
+                )
+
+                if not search_query:
+
+                    search_query = (
+                        query.get(
+                            "query",
+                            [""],
+                        )[0]
+                    )
+
+                if not search_query:
+
+                    search_query = (
+                        query.get(
+                            "symbol",
+                            [""],
+                        )[0]
+                    )
+
+                search_query = (
+                    unquote(
+                        search_query
+                    )
+                    .strip()
+                )
+
+                if not search_query:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "Search query is required. "
+                                "Use /api/search?q=GRDBL"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # Search pagination.
+                #
+                # IMPORTANT:
+                #
+                # This pagination is applied AFTER searching
+                # the entire 344-stock universe.
+                # ------------------------------------------------
+
+                try:
+
+                    page = int(
+                        query.get(
+                            "page",
+                            ["0"],
+                        )[0]
+                    )
+
+                    size = int(
+                        query.get(
+                            "size",
+                            ["20"],
+                        )[0]
+                    )
+
+                except ValueError:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page and size must be integers"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if page < 0:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page must be >= 0"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if size < 1 or size > 100:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "size must be between "
+                                "1 and 100"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # SEARCH ALL PAGES FIRST
+                # ------------------------------------------------
+
+                matching_stocks = (
+                    nepse.search_stocks(
+                        search_query
+                    )
+                )
+
+                total = len(
+                    matching_stocks
+                )
+
+                # ------------------------------------------------
+                # SORT:
+                #
+                # Exact symbol match first,
+                # then symbol prefix,
+                # then everything else.
+                #
+                # This makes searches such as GRDBL and ACLBSL
+                # return the exact stock first.
+                # ------------------------------------------------
+
+                normalized_query = (
+                    search_query
+                    .lower()
+                    .strip()
+                )
+
+                def search_sort_key(stock):
+
+                    symbol = str(
+                        first_present(
+                            stock,
+                            "symbol",
+                        ) or ""
+                    ).lower()
+
+                    security_name = str(
+                        first_present(
+                            stock,
+                            "securityName",
+                            "companyName",
+                        ) or ""
+                    ).lower()
+
+                    if symbol == normalized_query:
+                        priority = 0
+
+                    elif symbol.startswith(
+                        normalized_query
+                    ):
+                        priority = 1
+
+                    elif normalized_query in symbol:
+                        priority = 2
+
+                    elif normalized_query in security_name:
+                        priority = 3
+
+                    else:
+                        priority = 4
+
+                    return (
+                        priority,
+                        symbol,
+                        security_name,
+                    )
+
+                matching_stocks.sort(
+                    key=search_sort_key
+                )
+
+                # ------------------------------------------------
+                # APPLY SEARCH RESULT PAGINATION
+                # ------------------------------------------------
+
+                total_pages = (
+                    (
+                        total + size - 1
+                    )
+                    // size
+                    if total
+                    else 0
+                )
+
+                start = (
+                    page * size
+                )
+
+                end = (
+                    start + size
+                )
+
+                page_results = (
+                    matching_stocks[
+                        start:end
+                    ]
+                )
+
+                normalized_results = [
+                    normalize_stock(
+                        stock
+                    )
+                    for stock in page_results
+                ]
+
+                has_previous = (
+                    page > 0
+                    and total_pages > 0
+                    and page < total_pages
+                )
+
+                has_next = (
+                    page + 1
+                    < total_pages
+                )
+
+                # ------------------------------------------------
+                # Out-of-range page
+                # ------------------------------------------------
+
+                self.response(
+                    {
+                        "success": True,
+                        "query": search_query,
+                        "page": page,
+                        "size": size,
+
+                        "total": total,
+
+                        "totalPages": total_pages,
+
+                        "hasNext": has_next,
+
+                        "hasPrevious": has_previous,
+
+                        "count": len(
+                            normalized_results
+                        ),
+
+                        "data": normalized_results,
+                    }
+                )
+
+                return
+
+            # ==================================================
+            # STOCKS
+            # ==================================================
+
+            if path == "/api/stocks":
+
+                try:
+
+                    page = int(
+                        query.get(
+                            "page",
+                            ["0"],
+                        )[0]
+                    )
+
+                    size = int(
+                        query.get(
+                            "size",
+                            ["20"],
+                        )[0]
+                    )
+
+                except ValueError:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page and size must be integers"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if page < 0:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page must be >= 0"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if size < 1 or size > 100:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "size must be between "
+                                "1 and 100"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # IMPORTANT:
+                #
+                # /api/stocks remains normal NEPSE pagination.
+                #
+                # For searching, use /api/search instead.
+                # ------------------------------------------------
+
+                body, status = nepse.post(
+                    "/nepse-data/today-price",
+                    {
+                        "id": (
+                            nepse.get_floor_payload_id()
+                        ),
+                        "page": page,
+                        "size": size,
+                    },
+                )
+
+                data = json_or_raw(
+                    body
+                )
+
+                if (
+                    isinstance(data, dict)
+                    and "content" in data
+                ):
+
+                    data["content"] = [
+                        normalize_stock(
+                            stock
+                        )
+                        for stock in data[
+                            "content"
+                        ]
+                    ]
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "page": page,
+                        "size": size,
+                        "data": data,
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # SINGLE STOCK
+            # ==================================================
+
+            if path.startswith(
+                "/api/stocks/"
+            ):
+
+                symbol = unquote(
+                    path[
+                        len("/api/stocks/"):
+                    ]
+                ).strip().upper()
+
+                if (
+                    not symbol
+                    or "/" in symbol
+                ):
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "Invalid stock symbol"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                body, status = nepse.get(
+                    f"/security/{symbol}"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "symbol": symbol,
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # MARKET
+            # ==================================================
+
+            if path == "/api/market":
+
+                body, status = nepse.get(
+                    "/market-summary"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # INDEX
+            # ==================================================
+
+            if path == "/api/index":
+
+                body, status = nepse.get(
+                    "/nepse-index"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # MARKET STATUS
+            # ==================================================
+
+            if path == "/api/status":
+
+                body, status = nepse.get(
+                    "/nepse-data/market-open"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # GAINERS
+            # ==================================================
+
+            if path == "/api/gainers":
+
+                body, status = nepse.get(
+                    "/top-ten/top-gainer?all=true"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # LOSERS
+            # ==================================================
+
+            if path == "/api/losers":
+
+                body, status = nepse.get(
+                    "/top-ten/top-loser?all=true"
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            body
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # ORIGINAL NEPSE PROXY
+            # ==================================================
+
+            if path.startswith(
+                "/nepse/"
+            ):
+
+                nepse_path = path[
+                    len("/nepse/") - 1:
+                ]
+
+                body, status = nepse.get(
+                    nepse_path
+                )
+
+                self.response(
+                    json_or_raw(
+                        body
+                    ),
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # NOT FOUND
+            # ==================================================
+
+            self.response(
+                {
+                    "success": False,
+                    "error": (
+                        "Endpoint not found"
+                    ),
+                },
+                404,
+            )
+
+        except requests.RequestException as error:
+
+            print(
+                "GET REQUEST ERROR:",
+                repr(error),
+            )
+
+            self.response(
+                {
+                    "success": False,
+                    "error": (
+                        "NEPSE request failed"
+                    ),
+                    "details": str(error),
+                },
+                502,
+            )
+
+        except Exception as error:
+
+            print(
+                "GET ERROR:",
+                repr(error),
+            )
+
+            self.response(
+                {
+                    "success": False,
+                    "error": str(error),
+                },
+                500,
+            )
+
+    # --------------------------------------------------------
+    # POST
+    # --------------------------------------------------------
+
+    def do_POST(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
+
+        print(
+            "POST",
+            self.path
+        )
+
+        try:
+
+            content_length_header = (
+                self.headers.get(
+                    "Content-Length"
+                )
+            )
+
+            try:
+
+                content_length = int(
+                    content_length_header
+                    or 0
+                )
+
+            except ValueError:
+
+                self.response(
+                    {
+                        "success": False,
+                        "error": (
+                            "Invalid Content-Length"
+                        ),
+                    },
+                    400,
+                )
+
+                return
+
+            if content_length < 0:
+
+                self.response(
+                    {
+                        "success": False,
+                        "error": (
+                            "Invalid request body"
+                        ),
+                    },
+                    400,
+                )
+
+                return
+
+            body = None
+
+            if content_length:
+
+                raw = (
+                    self.rfile.read(
+                        content_length
+                    )
+                    .decode("utf-8")
+                )
+
+                if raw.strip():
+
+                    try:
+
+                        body = json.loads(
+                            raw
+                        )
+
+                    except json.JSONDecodeError as error:
+
+                        self.response(
+                            {
+                                "success": False,
+                                "error": (
+                                    "Invalid JSON"
+                                ),
+                                "details": str(
+                                    error
+                                ),
+                            },
+                            400,
+                        )
+
+                        return
+
+            # ==================================================
+            # TODAY PRICE
+            # ==================================================
+
+            if path == "/api/today-price":
+
+                response, status = (
+                    nepse.post(
+                        "/nepse-data/today-price",
+                        body,
+                    )
+                )
+
+                data = json_or_raw(
+                    response
+                )
+
+                if (
+                    isinstance(
+                        data,
+                        dict,
+                    )
+                    and "content" in data
+                ):
+
+                    data["content"] = [
+                        normalize_stock(
+                            stock
+                        )
+                        for stock in data[
+                            "content"
+                        ]
+                    ]
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": data,
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # FLOORSHEET
+            # ==================================================
+
+            if path == "/api/floorsheet":
+
+                response, status = (
+                    nepse.post(
+                        "/nepse-data/floorsheet",
+                        body,
+                    )
+                )
+
+                self.response(
+                    {
+                        "success": (
+                            status == 200
+                        ),
+                        "data": json_or_raw(
+                            response
+                        ),
+                    },
+                    status,
+                )
+
+                return
+
+            # ==================================================
+            # NOT FOUND
+            # ==================================================
+
+            self.response(
+                {
+                    "success": False,
+                    "error": (
+                        "POST endpoint not found"
+                    ),
+                },
+                404,
+            )
+
+        except requests.RequestException as error:
+
+            print(
+                "POST REQUEST ERROR:",
+                repr(error),
+            )
+
+            self.response(
+                {
+                    "success": False,
+                    "error": (
+                        "NEPSE request failed"
+                    ),
+                    "details": str(error),
+                },
+                502,
+            )
+
+        except Exception as error:
+
+            print(
+                "POST ERROR:",
+                repr(error),
+            )
+
+            self.response(
+                {
+                    "success": False,
+                    "error": str(error),
+                },
+                500,
+            )
+
+
+# ============================================================
+# SERVER
+# ============================================================
+
+class ReusableThreadingHTTPServer(
+    ThreadingHTTPServer
+):
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main():
+
+    server = ReusableThreadingHTTPServer(
+        (
+            "0.0.0.0",
+            PORT,
+        ),
+        Handler,
+    )
+
+    print()
+    print(
+        "=========================================="
+    )
+    print(
+        "             OPEN NEPSE API"
+    )
+    print(
+        "=========================================="
+    )
+    print()
+
+    print(
+        f"Server: {API_URL}"
+    )
+
+    print()
+
+    print(
+        f"Stocks: {API_URL}/api/stocks"
+    )
+
+    print(
+        f"Search: {API_URL}/api/search?q=GRDBL"
+    )
+
+    print(
+        f"Market: {API_URL}/api/market"
+    )
+
+    print(
+        f"Index:  {API_URL}/api/index"
+    )
+
+    print(
+        f"Status: {API_URL}/api/status"
+    )
+
+    print(
+        f"Today:  {API_URL}/api/today-price"
+    )
+
+    print(
+        f"Floor:  {API_URL}/api/floorsheet"
+    )
+
+    print()
+
+    print(
+        f"Search cache: "
+        f"{SEARCH_CACHE_SECONDS} seconds"
+    )
+
+    print(
+        f"Upstream page size: "
+        f"{UPSTREAM_PAGE_SIZE}"
+    )
+
+    print()
+
+    print(
+        "Press CTRL+C to stop."
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print()
+
+    try:
+
+        server.serve_forever()
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nStopping server..."
+        )
+
+    finally:
+
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
