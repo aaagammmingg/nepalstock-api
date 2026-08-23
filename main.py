@@ -1,3 +1,4 @@
+# FULL CODE – copy this entire block into your server.py
 import datetime as dt
 import json
 import os
@@ -18,7 +19,7 @@ import requests
 
 BASE_URL = "https://www.nepalstock.com.np"
 NEPSE_API = f"{BASE_URL}/api/nots"
-API_URL = "https://nepalstock-api-qycd.onrender.com"
+API_URL = "https://nepalstock-api-qycd.onrender.com"   # optional, change if needed
 
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -29,7 +30,7 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 STOCK_CACHE_TTL = 60
-PRICE_CACHE_TTL = 60  # Cache price data for 60 seconds
+PRICE_CACHE_TTL = 60
 
 
 # ============================================================
@@ -783,13 +784,13 @@ def main():
     print("\n==========================================")
     print("             OPEN NEPSE API")
     print("==========================================\n")
-    print(f"Server: {API_URL}\n")
-    print(f"Stocks: {API_URL}/api/stocks")
-    print(f"Search: {API_URL}/api/search?q=NGPL")
-    print(f"Market: {API_URL}/api/market")
-    print(f"Index:  {API_URL}/api/index")
-    print(f"Status: {API_URL}/api/status")
-    print(f"Today:  {API_URL}/api/today-price\n")
+    print(f"Server: http://localhost:{PORT}")
+    print(f"\nStocks: http://localhost:{PORT}/api/stocks")
+    print(f"Search: http://localhost:{PORT}/api/search?q=NGPL")
+    print(f"Market: http://localhost:{PORT}/api/market")
+    print(f"Index:  http://localhost:{PORT}/api/index")
+    print(f"Status: http://localhost:{PORT}/api/status")
+    print(f"Today:  http://localhost:{PORT}/api/today-price\n")
     print("Press CTRL+C to stop.")
     print("==========================================\n")
 
