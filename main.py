@@ -1,4 +1,3 @@
-# FULL CODE – copy this entire block into your server.py
 import datetime as dt
 import json
 import os
@@ -19,7 +18,7 @@ import requests
 
 BASE_URL = "https://www.nepalstock.com.np"
 NEPSE_API = f"{BASE_URL}/api/nots"
-API_URL = "https://nepalstock-api-qycd.onrender.com"   # optional, change if needed
+API_URL = "https://nepalstock-api-qycd.onrender.com"   # optional
 
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -121,24 +120,41 @@ def normalize_stock(stock, price_data=None):
         "timestamp": now_np().isoformat(),
     }
 
-    # If price_data is provided, extract fields from securityDailyTradeDto
+    # If price_data is provided, try to extract from various possible structures
     if price_data and isinstance(price_data, dict):
-        dto = price_data.get("securityDailyTradeDto") or {}
-        result.update({
-            "ltp": first_present(dto, "lastTradedPrice", "ltp"),
-            "open": first_present(dto, "openPrice", "open"),
-            "high": first_present(dto, "highPrice", "high"),
-            "low": first_present(dto, "lowPrice", "low"),
-            "previousClose": first_present(dto, "previousClose", "previousClosingPrice"),
-            "change": first_present(dto, "change", "difference"),
-            "percentageChange": first_present(dto, "percentageChange", "percentChange"),
-            "volume": first_present(dto, "totalTradeQuantity", "volume", "totalTradedQuantity"),
-            "turnover": first_present(dto, "totalTradeValue", "turnover"),
-            "trades": first_present(dto, "totalTrades", "numberOfTrades"),
-        })
-        # Also update timestamp if available
-        if "lastUpdatedDateTime" in dto:
-            result["timestamp"] = dto["lastUpdatedDateTime"]
+        # Primary: securityDailyTradeDto
+        dto = price_data.get("securityDailyTradeDto")
+        if dto and isinstance(dto, dict):
+            result.update({
+                "ltp": first_present(dto, "lastTradedPrice", "ltp"),
+                "open": first_present(dto, "openPrice", "open"),
+                "high": first_present(dto, "highPrice", "high"),
+                "low": first_present(dto, "lowPrice", "low"),
+                "previousClose": first_present(dto, "previousClose", "previousClosingPrice"),
+                "change": first_present(dto, "change", "difference"),
+                "percentageChange": first_present(dto, "percentageChange", "percentChange"),
+                "volume": first_present(dto, "totalTradeQuantity", "volume", "totalTradedQuantity"),
+                "turnover": first_present(dto, "totalTradeValue", "turnover"),
+                "trades": first_present(dto, "totalTrades", "numberOfTrades"),
+            })
+            if "lastUpdatedDateTime" in dto:
+                result["timestamp"] = dto["lastUpdatedDateTime"]
+        else:
+            # Fallback: top-level fields
+            result.update({
+                "ltp": first_present(price_data, "lastTradedPrice", "ltp", "closePrice", "close"),
+                "open": first_present(price_data, "openPrice", "open"),
+                "high": first_present(price_data, "highPrice", "high"),
+                "low": first_present(price_data, "lowPrice", "low"),
+                "previousClose": first_present(price_data, "previousClose", "previousClosingPrice"),
+                "change": first_present(price_data, "change", "difference"),
+                "percentageChange": first_present(price_data, "percentageChange", "percentChange"),
+                "volume": first_present(price_data, "totalTradeQuantity", "volume", "totalTradedQuantity"),
+                "turnover": first_present(price_data, "totalTradeValue", "turnover"),
+                "trades": first_present(price_data, "totalTrades", "numberOfTrades"),
+            })
+            if "lastUpdatedDateTime" in price_data:
+                result["timestamp"] = price_data["lastUpdatedDateTime"]
 
     return result
 
@@ -401,7 +417,7 @@ class Nepse:
         response = session.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
         return response.text, response.status_code
 
-    # ---------- Fetch all securities (using /security endpoint) ----------
+    # ---------- Fetch all securities ----------
     def fetch_all_securities(self, force_refresh=False):
         with self._cache_lock:
             if not force_refresh and self._security_cache is not None:
@@ -431,13 +447,12 @@ class Nepse:
 
         return data
 
-    # ---------- Fetch price data for a specific symbol ----------
+    # ---------- Fetch price data for a symbol ----------
     def get_price_for_symbol(self, symbol, force_refresh=False):
         """
         Fetch detailed price data for a given symbol using /security/{symbol}.
         Returns the parsed JSON, or None if not found.
         """
-        # Check cache
         cache_key = symbol.upper()
         with self._cache_lock:
             if not force_refresh and cache_key in self._price_cache:
@@ -449,12 +464,16 @@ class Nepse:
         print(f"Fetching price for {symbol}...")
         body, status = self.get(f"/security/{symbol}")
         if status != 200:
-            print(f"Could not fetch price for {symbol}. HTTP {status}")
+            print(f"  -> HTTP {status} for {symbol}")
             return None
 
         data = json_or_raw(body)
         if not isinstance(data, dict):
+            print(f"  -> Unexpected response type for {symbol}: {type(data)}")
             return None
+
+        # Log keys for debugging
+        print(f"  -> Response keys: {list(data.keys())[:10]}")
 
         # Cache it
         with self._cache_lock:
@@ -462,11 +481,11 @@ class Nepse:
 
         return data
 
-    # ---------- Public method to get all stocks (for search) ----------
+    # ---------- Public method to get all stocks ----------
     def get_all_stocks(self, force_refresh=False):
         return self.fetch_all_securities(force_refresh)
 
-    # ---------- Existing methods for other endpoints ----------
+    # ---------- Existing method for /api/stocks ----------
     def get_stock_page(self, page=0, size=20):
         payload_id = self.get_floor_payload_id()
         body, status = self.post(
@@ -572,7 +591,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": False, "error": "size must be between 1 and 100"}, 400)
                     return
 
-                # Get the full security list
                 all_stocks = nepse.get_all_stocks()
                 matches = [s for s in all_stocks if stock_matches_query(s, q)]
                 total = len(matches)
@@ -581,7 +599,6 @@ class Handler(BaseHTTPRequestHandler):
                 paginated = matches[start:end]
                 total_pages = (total + size - 1) // size if total > 0 else 0
 
-                # Enrich each matched stock with price data (only for the paginated subset)
                 enriched_data = []
                 for stock in paginated:
                     symbol = extract_symbol(stock)
@@ -646,7 +663,6 @@ class Handler(BaseHTTPRequestHandler):
                 paginated = matches[start:end]
                 total_pages = (total + size - 1) // size if total > 0 else 0
 
-                # Enrich with price data
                 enriched_data = []
                 for stock in paginated:
                     sym = extract_symbol(stock)
