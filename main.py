@@ -28,10 +28,6 @@ BASE_DIR = Path(__file__).resolve().parent
 WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
-
-# Try a very large page size to fetch all stocks in one request
-NEPSE_PAGE_SIZE = 500
-MAX_STOCK_PAGES = 500   # safety limit
 STOCK_CACHE_TTL = 60
 
 
@@ -40,7 +36,6 @@ STOCK_CACHE_TTL = 60
 # ============================================================
 
 session = requests.Session()
-
 session.headers.update(
     {
         "User-Agent": (
@@ -88,43 +83,38 @@ def safe_int(value, default=None):
 
 
 def extract_symbol(stock):
-    return first_present(
-        stock,
-        "symbol",
-        "securitySymbol",
-        "ticker",
-        "code",
-        "scripCode",
-        "stockSymbol"
-    )
+    return first_present(stock, "symbol", "securitySymbol", "ticker", "code", "scripCode", "stockSymbol")
 
 
 def extract_security_name(stock):
-    return first_present(
-        stock,
-        "securityName",
-        "companyName",
-        "securityNameNepali",
-        "name",
-        "stockName"
-    )
+    return first_present(stock, "securityName", "companyName", "securityNameNepali", "name", "stockName")
+
+
+def extract_security_id(stock):
+    return first_present(stock, "securityId", "id", "security_id")
 
 
 def normalize_stock(stock):
+    """
+    Normalize a stock record. If it's from the /security endpoint,
+    only symbol, securityName, and securityId are available.
+    """
     if not isinstance(stock, dict):
         return stock
 
+    # Try to get price fields if they exist (from /today-price)
     return {
         "symbol": extract_symbol(stock),
         "securityName": extract_security_name(stock),
-        "ltp": first_present(stock, "lastTradedPrice", "ltp"),
+        "securityId": extract_security_id(stock),
+        "ltp": first_present(stock, "lastTradedPrice", "ltp", "lastTradedPrice"),
         "open": first_present(stock, "openPrice", "open"),
         "high": first_present(stock, "highPrice", "high"),
         "low": first_present(stock, "lowPrice", "low"),
         "previousClose": first_present(stock, "previousClose", "previousClosingPrice"),
         "change": first_present(stock, "change", "difference"),
         "percentageChange": first_present(stock, "percentageChange", "percentChange"),
-        "volume": first_present(stock, "totalTradeQuantity", "volume"),
+        "volume": first_present(stock, "totalTradeQuantity", "volume", "totalTradedQuantity"),
         "turnover": first_present(stock, "totalTradeValue", "turnover"),
         "trades": first_present(stock, "totalTrades", "numberOfTrades"),
         "timestamp": now_np().isoformat(),
@@ -132,10 +122,14 @@ def normalize_stock(stock):
 
 
 def stock_matches_query(stock, query):
+    """
+    Case-insensitive partial match on symbol, securityName, and securityId.
+    """
     query_lower = query.lower()
     symbol = str(extract_symbol(stock) or "").lower()
     name = str(extract_security_name(stock) or "").lower()
-    return query_lower in symbol or query_lower in name
+    sid = str(extract_security_id(stock) or "").lower()
+    return query_lower in symbol or query_lower in name or query_lower in sid
 
 
 # ============================================================
@@ -227,8 +221,9 @@ class Nepse:
         self.payload_id = None
         self.lock = threading.RLock()
 
-        self._stock_cache = None
-        self._stock_cache_time = None
+        # Cache for the full security list
+        self._security_cache = None
+        self._security_cache_time = None
         self._cache_lock = threading.RLock()
 
     # ---------- Authentication ----------
@@ -383,10 +378,55 @@ class Nepse:
         response = session.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
         return response.text, response.status_code
 
-    # ---------- Fetch one page ----------
-    def get_stock_page(self, page=0, size=500):
+    # ---------- Fetch all securities (using /security endpoint) ----------
+    def fetch_all_securities(self, force_refresh=False):
         """
-        Fetch one page from NEPSE today-price.
+        Fetch the full list of securities from /security (GET).
+        This endpoint returns all securities without pagination.
+        """
+        with self._cache_lock:
+            if not force_refresh and self._security_cache is not None:
+                if time.time() - self._security_cache_time < STOCK_CACHE_TTL:
+                    print("Using cached security list")
+                    return self._security_cache
+
+        print("Fetching full security list from /security...")
+        body, status = self.get("/security")
+        if status != 200:
+            raise RuntimeError(f"Could not fetch security list. HTTP {status}: {body[:500]}")
+
+        data = json_or_raw(body)
+        if not isinstance(data, list):
+            # Sometimes the response might be wrapped in a 'content' or 'data' field
+            if isinstance(data, dict):
+                data = data.get("content") or data.get("data") or data.get("items")
+                if not isinstance(data, list):
+                    data = []
+            else:
+                data = []
+
+        print(f"Fetched {len(data)} securities.")
+
+        # Cache
+        with self._cache_lock:
+            self._security_cache = data
+            self._security_cache_time = time.time()
+
+        return data
+
+    # ---------- Public method to get all stocks (for search) ----------
+    def get_all_stocks(self, force_refresh=False):
+        """
+        Returns the full list of securities.
+        This is used for the search endpoint.
+        """
+        return self.fetch_all_securities(force_refresh)
+
+    # ---------- Existing methods for other endpoints ----------
+    def get_stock_page(self, page=0, size=20):
+        """
+        Fetch one page from today-price (for /api/stocks).
+        Note: pagination may not work; we keep it for compatibility.
         """
         payload_id = self.get_floor_payload_id()
         body, status = self.post(
@@ -399,116 +439,6 @@ class Nepse:
         if not isinstance(data, dict):
             raise RuntimeError(f"Unexpected today-price response on page {page}")
         return data
-
-    # ---------- Fetch all pages (try single large page first) ----------
-    def fetch_all_pages(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
-        """
-        Attempt to fetch all stocks in one page by using a large `size`.
-        If that fails (returns only 20), fall back to looping but detect duplicates.
-        """
-        with self._cache_lock:
-            if not force_refresh and self._stock_cache is not None:
-                if time.time() - self._stock_cache_time < STOCK_CACHE_TTL:
-                    print("Using cached stock list")
-                    return {
-                        "stocks": self._stock_cache,
-                        "raw_first_page": None,
-                        "total_fetched": len(self._stock_cache)
-                    }
-
-        # First, try to fetch all with a large page size
-        print(f"Fetching NEPSE stocks with page_size={page_size} (attempting single page)...")
-        first_data = self.get_stock_page(page=0, size=page_size)
-        content = first_data.get("content")
-        if content is None:
-            content = first_data.get("data")
-        if content is None:
-            content = first_data.get("items")
-        if not isinstance(content, list):
-            content = []
-
-        total_elements = first_data.get("totalElements")
-        total_pages = first_data.get("totalPages")
-
-        print(f"  Page 0: {len(content)} items, totalElements={total_elements}, totalPages={total_pages}")
-
-        # If we got all stocks in one page (or close), we're done
-        if total_elements is not None and len(content) >= total_elements:
-            final_stocks = content
-            print(f"Fetched all {len(final_stocks)} stocks in one page.")
-            # Update cache
-            with self._cache_lock:
-                self._stock_cache = final_stocks
-                self._stock_cache_time = time.time()
-            return {
-                "stocks": final_stocks,
-                "raw_first_page": first_data,
-                "total_fetched": len(final_stocks)
-            }
-
-        # If we got fewer, but total_pages > 1, pagination might work.
-        # Try looping with the same page_size.
-        if total_pages is not None and total_pages > 1:
-            print(f"Attempting to fetch all {total_pages} pages with page_size={page_size}...")
-            stock_map = {}
-            # Add first page
-            for stock in content:
-                sym = extract_symbol(stock)
-                if sym:
-                    stock_map[sym] = stock
-                else:
-                    stock_map[f"__no_symbol_{id(stock)}"] = stock
-
-            for page in range(1, total_pages):
-                print(f"  Fetching page {page}...")
-                data = self.get_stock_page(page=page, size=page_size)
-                page_content = data.get("content")
-                if page_content is None:
-                    page_content = data.get("data")
-                if page_content is None:
-                    page_content = data.get("items")
-                if not isinstance(page_content, list):
-                    page_content = []
-                print(f"    Page {page}: {len(page_content)} items")
-                for stock in page_content:
-                    sym = extract_symbol(stock)
-                    if sym:
-                        stock_map[sym] = stock
-                    else:
-                        stock_map[f"__no_symbol_{id(stock)}"] = stock
-                # If we have enough, break
-                if total_elements is not None and len(stock_map) >= total_elements:
-                    break
-
-            final_stocks = list(stock_map.values())
-            print(f"Fetched {len(final_stocks)} unique stocks across {page+1} pages.")
-            # Update cache
-            with self._cache_lock:
-                self._stock_cache = final_stocks
-                self._stock_cache_time = time.time()
-            return {
-                "stocks": final_stocks,
-                "raw_first_page": first_data,
-                "total_fetched": len(final_stocks)
-            }
-
-        # If we still have only 20 and totalPages is 1 or missing,
-        # pagination is likely broken. Try to detect duplicates and warn.
-        # For now, just return what we have.
-        print("WARNING: Unable to fetch more than one page. Only returning first page.")
-        final_stocks = content
-        with self._cache_lock:
-            self._stock_cache = final_stocks
-            self._stock_cache_time = time.time()
-        return {
-            "stocks": final_stocks,
-            "raw_first_page": first_data,
-            "total_fetched": len(final_stocks)
-        }
-
-    def get_all_stocks(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
-        result = self.fetch_all_pages(page_size, force_refresh)
-        return result["stocks"]
 
 
 # ============================================================
@@ -576,26 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                         "/api/losers",
                         "/api/today-price",
                         "/api/floorsheet",
-                        "/api/debug-stocks",
                     ],
-                })
-                return
-
-            # ---------- DEBUG ----------
-            if path == "/api/debug-stocks":
-                result = nepse.fetch_all_pages(force_refresh=True)
-                sample = []
-                for stock in result["stocks"][:10]:
-                    sample.append({
-                        "symbol": extract_symbol(stock),
-                        "name": extract_security_name(stock),
-                        "raw": stock
-                    })
-                self.response({
-                    "success": True,
-                    "total_fetched": result["total_fetched"],
-                    "raw_first_page": result["raw_first_page"],
-                    "sample_stocks": sample,
                 })
                 return
 
@@ -621,6 +532,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": False, "error": "size must be between 1 and 100"}, 400)
                     return
 
+                # Get the full security list
                 all_stocks = nepse.get_all_stocks()
                 matches = [s for s in all_stocks if stock_matches_query(s, q)]
                 total = len(matches)
@@ -652,22 +564,27 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     self.response({"success": False, "error": "page and size must be integers"}, 400)
                     return
-                if page < 0 or size < 1 or size > 500:
+                if page < 0 or size < 1 or size > 100:
                     self.response({"success": False, "error": "invalid page or size"}, 400)
                     return
 
                 symbol = query.get("symbol", [""])[0].strip()
                 security_name = query.get("securityName", [""])[0].strip()
 
+                # If no filter, use the today-price endpoint (paginated, but may not work)
                 if not symbol and not security_name:
-                    data = nepse.get_stock_page(page=page, size=size)
-                    if isinstance(data, dict):
-                        content = data.get("content") or data.get("data") or []
-                        if isinstance(content, list):
-                            data["content"] = [normalize_stock(s) for s in content]
-                    self.response({"success": True, "page": page, "size": size, "data": data})
+                    try:
+                        data = nepse.get_stock_page(page=page, size=size)
+                        if isinstance(data, dict):
+                            content = data.get("content") or data.get("data") or []
+                            if isinstance(content, list):
+                                data["content"] = [normalize_stock(s) for s in content]
+                        self.response({"success": True, "page": page, "size": size, "data": data})
+                    except Exception as e:
+                        self.response({"success": False, "error": str(e)}, 500)
                     return
 
+                # If filter is present, search the full security list
                 all_stocks = nepse.get_all_stocks()
                 matches = []
                 for s in all_stocks:
@@ -817,7 +734,6 @@ def main():
     print(f"Server: {API_URL}\n")
     print(f"Stocks: {API_URL}/api/stocks")
     print(f"Search: {API_URL}/api/search?q=NGPL")
-    print(f"Debug:  {API_URL}/api/debug-stocks")
     print(f"Market: {API_URL}/api/market")
     print(f"Index:  {API_URL}/api/index")
     print(f"Status: {API_URL}/api/status")
