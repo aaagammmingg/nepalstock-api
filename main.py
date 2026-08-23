@@ -29,6 +29,7 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 
+# Use a larger page size to reduce the number of requests
 NEPSE_PAGE_SIZE = 100
 MAX_STOCK_PAGES = 100
 STOCK_CACHE_TTL = 60
@@ -87,12 +88,26 @@ def safe_int(value, default=None):
 
 
 def extract_symbol(stock):
-    """Try multiple field names for symbol."""
-    return first_present(stock, "symbol", "securitySymbol", "ticker", "code", "scripCode", "stockSymbol")
+    return first_present(
+        stock,
+        "symbol",
+        "securitySymbol",
+        "ticker",
+        "code",
+        "scripCode",
+        "stockSymbol"
+    )
 
 
 def extract_security_name(stock):
-    return first_present(stock, "securityName", "companyName", "securityNameNepali", "name", "stockName")
+    return first_present(
+        stock,
+        "securityName",
+        "companyName",
+        "securityNameNepali",
+        "name",
+        "stockName"
+    )
 
 
 def normalize_stock(stock):
@@ -124,7 +139,7 @@ def stock_matches_query(stock, query):
 
 
 # ============================================================
-# TOKEN PARSER (unchanged)
+# TOKEN PARSER
 # ============================================================
 
 class TokenParser:
@@ -148,7 +163,10 @@ class TokenParser:
         if len(indexes) != 5:
             raise ValueError(f"{token_name}: expected 5 indexes")
         if any(i < 0 or i >= len(token) for i in indexes):
-            raise ValueError(f"{token_name}: WASM produced an invalid token index. token length={len(token)}, indexes={indexes}")
+            raise ValueError(
+                f"{token_name}: WASM produced an invalid token index. "
+                f"token length={len(token)}, indexes={indexes}"
+            )
         if len(set(indexes)) != len(indexes):
             raise ValueError(f"{token_name}: duplicate token indexes: {indexes}")
         chars = list(token)
@@ -157,7 +175,10 @@ class TokenParser:
         return "".join(chars)
 
     def parse_token_response(self, token):
-        required = ["salt1", "salt2", "salt3", "salt4", "salt5", "accessToken", "refreshToken"]
+        required = [
+            "salt1", "salt2", "salt3", "salt4", "salt5",
+            "accessToken", "refreshToken"
+        ]
         missing = [key for key in required if key not in token]
         if missing:
             raise ValueError("Authentication response is missing: " + ", ".join(missing))
@@ -365,7 +386,10 @@ class Nepse:
     # ---------- Fetch one page ----------
     def get_stock_page(self, page=0, size=100):
         payload_id = self.get_floor_payload_id()
-        body, status = self.post("/nepse-data/today-price", {"id": payload_id, "page": page, "size": size})
+        body, status = self.post(
+            "/nepse-data/today-price",
+            {"id": payload_id, "page": page, "size": size}
+        )
         if status != 200:
             raise RuntimeError(f"Could not fetch stock page {page}. HTTP {status}: {body[:500]}")
         data = json_or_raw(body)
@@ -373,86 +397,108 @@ class Nepse:
             raise RuntimeError(f"Unexpected today-price response on page {page}")
         return data
 
-    # ---------- Fetch all pages (with caching and debug) ----------
+    # ---------- Fetch all pages (with caching) ----------
     def fetch_all_pages(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
         """
-        Fetch all pages, returning a dict with:
-          - stocks: list of unique stock dicts
-          - raw_first_page: the raw response of page 0 (for debugging)
-          - total_fetched: number of stocks fetched
+        Fetch every page of stocks from NEPSE.
+        Uses totalPages from the first response to know how many pages to fetch.
         """
         with self._cache_lock:
             if not force_refresh and self._stock_cache is not None:
                 if time.time() - self._stock_cache_time < STOCK_CACHE_TTL:
                     print("Using cached stock list")
-                    # We don't have raw_first_page in cache, but we can return a dummy
                     return {
                         "stocks": self._stock_cache,
                         "raw_first_page": None,
                         "total_fetched": len(self._stock_cache)
                     }
 
-        all_stocks = []
-        stock_map = {}
-        page = 0
-        raw_first_page = None
+        # Fetch page 0 to get pagination metadata
+        print(f"Fetching NEPSE stock page 0 (size={page_size})...")
+        first_page = self.get_stock_page(page=0, size=page_size)
 
-        while page < MAX_STOCK_PAGES:
-            print(f"Fetching NEPSE stock page {page} (size={page_size})...")
-            data = self.get_stock_page(page=page, size=page_size)
-            if page == 0:
-                raw_first_page = data  # store for debug
+        # Extract content
+        content = first_page.get("content")
+        if content is None:
+            content = first_page.get("data")
+        if content is None:
+            content = first_page.get("items")
+        if content is None:
+            content = first_page.get("results")
+        if not isinstance(content, list):
+            content = []
 
-            # Try to extract content from various possible keys
-            content = data.get("content")
-            if content is None:
-                content = data.get("data")
-            if content is None:
-                content = data.get("items")
-            if content is None:
-                content = data.get("results")
-            if content is None:
-                # If none of the above, maybe the response is a list directly?
-                if isinstance(data, list):
-                    content = data
-                else:
-                    content = []
+        # Store first page raw for debug
+        raw_first_page = first_page
 
-            if not isinstance(content, list):
-                content = []
-
-            print(f"  Page {page}: {len(content)} items")
-
-            # Log first item to see structure
-            if content:
-                print(f"  First item on page {page}: {json.dumps(content[0], indent=2)[:500]}")
-
-            for stock in content:
-                sym = extract_symbol(stock)
-                if sym:
-                    stock_map[sym] = stock
-                else:
-                    all_stocks.append(stock)  # fallback
-
-            # Determine if we have all pages
-            total_pages = data.get("totalPages")
-            total_elements = data.get("totalElements")
-            current_page = data.get("number")
-
-            if total_pages is not None and total_pages > 0:
-                if current_page is not None and current_page >= total_pages - 1:
-                    break
-            elif total_elements is not None and total_elements > 0:
-                if len(stock_map) + len(all_stocks) >= total_elements:
-                    break
+        # Get total pages from metadata
+        total_pages = first_page.get("totalPages")
+        if total_pages is None:
+            total_pages = first_page.get("total_pages")
+        if total_pages is None:
+            # Fallback: estimate from totalElements
+            total_elements = first_page.get("totalElements")
+            if total_elements is not None:
+                total_pages = (total_elements + page_size - 1) // page_size
             else:
-                # Fallback: if this page has fewer items than requested, it's the last
-                if len(content) < page_size:
-                    break
-                if not content:
-                    break
+                total_pages = None
 
-            page += 1
+        stock_map = {}  # deduplicate by symbol
+        all_stocks = []
+
+        # Add stocks from first page
+        for stock in content:
+            sym = extract_symbol(stock)
+            if sym:
+                stock_map[sym] = stock
+            else:
+                all_stocks.append(stock)
+
+        print(f"  Page 0: {len(content)} items, totalPages={total_pages}")
+
+        if total_pages is not None and total_pages > 1:
+            # Fetch remaining pages using a simple for loop
+            for page in range(1, total_pages):
+                print(f"Fetching NEPSE stock page {page} (size={page_size})...")
+                data = self.get_stock_page(page=page, size=page_size)
+                content = data.get("content")
+                if content is None:
+                    content = data.get("data")
+                if content is None:
+                    content = data.get("items")
+                if not isinstance(content, list):
+                    content = []
+                print(f"  Page {page}: {len(content)} items")
+                for stock in content:
+                    sym = extract_symbol(stock)
+                    if sym:
+                        stock_map[sym] = stock
+                    else:
+                        all_stocks.append(stock)
+                # Optional: stop early if we have enough? But we trust totalPages.
+        else:
+            # Fallback: use incremental loop with break conditions
+            page = 1
+            while page < MAX_STOCK_PAGES:
+                print(f"Fetching NEPSE stock page {page} (size={page_size})...")
+                data = self.get_stock_page(page=page, size=page_size)
+                content = data.get("content")
+                if content is None:
+                    content = data.get("data")
+                if content is None:
+                    content = data.get("items")
+                if not isinstance(content, list):
+                    content = []
+                print(f"  Page {page}: {len(content)} items")
+                if not content or len(content) < page_size:
+                    break
+                for stock in content:
+                    sym = extract_symbol(stock)
+                    if sym:
+                        stock_map[sym] = stock
+                    else:
+                        all_stocks.append(stock)
+                page += 1
 
         final_stocks = list(stock_map.values()) + all_stocks
         print(f"Total unique stocks fetched: {len(final_stocks)}")
@@ -543,10 +589,9 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # ---------- DEBUG: Show raw first page and total count ----------
+            # ---------- DEBUG ----------
             if path == "/api/debug-stocks":
                 result = nepse.fetch_all_pages(force_refresh=True)
-                # Extract a few symbols for quick check
                 sample = []
                 for stock in result["stocks"][:10]:
                     sample.append({
@@ -585,7 +630,6 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 all_stocks = nepse.get_all_stocks(page_size=100)
-
                 matches = [s for s in all_stocks if stock_matches_query(s, q)]
                 total = len(matches)
                 start = page * size
