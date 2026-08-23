@@ -31,7 +31,7 @@ REQUEST_TIMEOUT = (10, 30)
 
 # Try a very large page size to fetch all stocks in one request
 NEPSE_PAGE_SIZE = 500
-MAX_STOCK_PAGES = 100   # safety limit
+MAX_STOCK_PAGES = 500   # safety limit
 STOCK_CACHE_TTL = 60
 
 
