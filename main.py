@@ -1120,6 +1120,28 @@ def first_present(mapping, *keys):
 
     return None
 
+def matches_stock(stock, symbol=None, security_name=None):
+    symbol = (symbol or "").strip().lower()
+    security_name = (security_name or "").strip().lower()
+
+    if symbol:
+        stock_symbol = str(
+            stock.get("symbol", "")
+        ).lower()
+
+        if symbol not in stock_symbol:
+            return False
+
+    if security_name:
+        name = str(
+            stock.get("securityName", "")
+        ).lower()
+
+        if security_name not in name:
+            return False
+
+    return True
+
 
 def normalize_stock(stock):
     if not isinstance(stock, dict):
@@ -1952,6 +1974,65 @@ class Handler(BaseHTTPRequestHandler):
 
             #     return
 
+            # if path == "/api/stocks":
+
+            #     query = parse_qs(parsed.query)
+
+            #     page = int(query.get("page", ["0"])[0])
+            #     size = int(query.get("size", ["20"])[0])
+
+            #     if page < 0:
+            #         self.response(
+            #             {
+            #                 "success": False,
+            #                 "error": "page must be >= 0",
+            #             },
+            #             400,
+            #         )
+            #         return
+
+            #     if size < 1 or size > 100:
+            #         self.response(
+            #             {
+            #                 "success": False,
+            #                 "error": "size must be between 1 and 100",
+            #             },
+            #             400,
+            #         )
+            #         return
+
+            #     payload_id = nepse.get_floor_payload_id()
+
+            #     body, status = nepse.post(
+            #         "/nepse-data/today-price",
+            #         {
+            #             "id": payload_id,
+            #             "page": page,
+            #             "size": size,
+            #         },
+            #     )
+
+            #     data = json_or_raw(body)
+
+            #     if isinstance(data, dict) and "content" in data:
+
+            #         data["content"] = [
+            #             normalize_stock(stock)
+            #             for stock in data["content"]
+            #         ]
+
+            #     self.response(
+            #         {
+            #             "success": status == 200,
+            #             "page": page,
+            #             "size": size,
+            #             "data": data,
+            #         },
+            #         status,
+            #     )
+
+            #     return
+
             if path == "/api/stocks":
 
                 query = parse_qs(parsed.query)
@@ -1959,32 +2040,13 @@ class Handler(BaseHTTPRequestHandler):
                 page = int(query.get("page", ["0"])[0])
                 size = int(query.get("size", ["20"])[0])
 
-                if page < 0:
-                    self.response(
-                        {
-                            "success": False,
-                            "error": "page must be >= 0",
-                        },
-                        400,
-                    )
-                    return
-
-                if size < 1 or size > 100:
-                    self.response(
-                        {
-                            "success": False,
-                            "error": "size must be between 1 and 100",
-                        },
-                        400,
-                    )
-                    return
-
-                payload_id = nepse.get_floor_payload_id()
+                symbol = query.get("symbol", [""])[0]
+                security_name = query.get("securityName", [""])[0]
 
                 body, status = nepse.post(
                     "/nepse-data/today-price",
                     {
-                        "id": payload_id,
+                        "id": nepse.get_floor_payload_id(),
                         "page": page,
                         "size": size,
                     },
@@ -1994,9 +2056,21 @@ class Handler(BaseHTTPRequestHandler):
 
                 if isinstance(data, dict) and "content" in data:
 
+                    stocks = data["content"]
+
+                    stocks = [
+                        stock
+                        for stock in stocks
+                        if matches_stock(
+                            stock,
+                            symbol,
+                            security_name,
+                        )
+                    ]
+
                     data["content"] = [
                         normalize_stock(stock)
-                        for stock in data["content"]
+                        for stock in stocks
                     ]
 
                 self.response(
