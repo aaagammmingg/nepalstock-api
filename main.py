@@ -31,7 +31,7 @@ REQUEST_TIMEOUT = (10, 30)
 
 # Use a larger page size to reduce the number of requests
 NEPSE_PAGE_SIZE = 100
-MAX_STOCK_PAGES = 100
+MAX_STOCK_PAGES = 100   # safety limit
 STOCK_CACHE_TTL = 60
 
 
@@ -397,11 +397,11 @@ class Nepse:
             raise RuntimeError(f"Unexpected today-price response on page {page}")
         return data
 
-    # ---------- Fetch all pages (with caching) ----------
+    # ---------- Fetch all pages (robust while loop) ----------
     def fetch_all_pages(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
         """
-        Fetch every page of stocks from NEPSE.
-        Uses totalPages from the first response to know how many pages to fetch.
+        Fetch every page of stocks from NEPSE using a simple while loop.
+        Stops when a page contains fewer items than page_size or is empty.
         """
         with self._cache_lock:
             if not force_refresh and self._stock_cache is not None:
@@ -413,92 +413,53 @@ class Nepse:
                         "total_fetched": len(self._stock_cache)
                     }
 
-        # Fetch page 0 to get pagination metadata
-        print(f"Fetching NEPSE stock page 0 (size={page_size})...")
-        first_page = self.get_stock_page(page=0, size=page_size)
-
-        # Extract content
-        content = first_page.get("content")
-        if content is None:
-            content = first_page.get("data")
-        if content is None:
-            content = first_page.get("items")
-        if content is None:
-            content = first_page.get("results")
-        if not isinstance(content, list):
-            content = []
-
-        # Store first page raw for debug
-        raw_first_page = first_page
-
-        # Get total pages from metadata
-        total_pages = first_page.get("totalPages")
-        if total_pages is None:
-            total_pages = first_page.get("total_pages")
-        if total_pages is None:
-            # Fallback: estimate from totalElements
-            total_elements = first_page.get("totalElements")
-            if total_elements is not None:
-                total_pages = (total_elements + page_size - 1) // page_size
-            else:
-                total_pages = None
-
-        stock_map = {}  # deduplicate by symbol
         all_stocks = []
+        stock_map = {}      # deduplicate by symbol
+        raw_first_page = None
+        page = 0
 
-        # Add stocks from first page
-        for stock in content:
-            sym = extract_symbol(stock)
-            if sym:
-                stock_map[sym] = stock
-            else:
-                all_stocks.append(stock)
+        while page < MAX_STOCK_PAGES:
+            print(f"Fetching NEPSE stock page {page} (size={page_size})...")
+            data = self.get_stock_page(page=page, size=page_size)
 
-        print(f"  Page 0: {len(content)} items, totalPages={total_pages}")
+            # Store first page for debugging
+            if page == 0:
+                raw_first_page = data
 
-        if total_pages is not None and total_pages > 1:
-            # Fetch remaining pages using a simple for loop
-            for page in range(1, total_pages):
-                print(f"Fetching NEPSE stock page {page} (size={page_size})...")
-                data = self.get_stock_page(page=page, size=page_size)
-                content = data.get("content")
-                if content is None:
-                    content = data.get("data")
-                if content is None:
-                    content = data.get("items")
-                if not isinstance(content, list):
-                    content = []
-                print(f"  Page {page}: {len(content)} items")
-                for stock in content:
-                    sym = extract_symbol(stock)
-                    if sym:
-                        stock_map[sym] = stock
-                    else:
-                        all_stocks.append(stock)
-                # Optional: stop early if we have enough? But we trust totalPages.
-        else:
-            # Fallback: use incremental loop with break conditions
-            page = 1
-            while page < MAX_STOCK_PAGES:
-                print(f"Fetching NEPSE stock page {page} (size={page_size})...")
-                data = self.get_stock_page(page=page, size=page_size)
-                content = data.get("content")
-                if content is None:
-                    content = data.get("data")
-                if content is None:
-                    content = data.get("items")
-                if not isinstance(content, list):
-                    content = []
-                print(f"  Page {page}: {len(content)} items")
-                if not content or len(content) < page_size:
-                    break
-                for stock in content:
-                    sym = extract_symbol(stock)
-                    if sym:
-                        stock_map[sym] = stock
-                    else:
-                        all_stocks.append(stock)
-                page += 1
+            # Extract content – try common keys
+            content = data.get("content")
+            if content is None:
+                content = data.get("data")
+            if content is None:
+                content = data.get("items")
+            if content is None:
+                content = data.get("results")
+            if not isinstance(content, list):
+                content = []
+
+            print(f"  Page {page}: {len(content)} items")
+
+            if not content:
+                # Empty page – we've reached the end
+                break
+
+            # Add stocks to dedup map
+            for stock in content:
+                sym = extract_symbol(stock)
+                if sym:
+                    stock_map[sym] = stock
+                else:
+                    all_stocks.append(stock)  # fallback
+
+            # If we got fewer items than requested, this is the last page
+            if len(content) < page_size:
+                print(f"  Page {page} has fewer than {page_size} items – assuming last page.")
+                break
+
+            page += 1
+
+        if page >= MAX_STOCK_PAGES:
+            print("WARNING: reached maximum page limit.")
 
         final_stocks = list(stock_map.values()) + all_stocks
         print(f"Total unique stocks fetched: {len(final_stocks)}")
