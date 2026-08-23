@@ -1922,29 +1922,88 @@ class Handler(BaseHTTPRequestHandler):
             # STOCKS
             # ==================================================
 
+            # if path == "/api/stocks":
+
+            #     body, status = nepse.post(
+            #         "/nepse-data/today-price"
+            #     )
+
+            #     data = json_or_raw(body)
+
+            #     if isinstance(data, list):
+
+            #         data = [
+            #             normalize_stock(stock)
+            #             for stock in data
+            #         ]
+
+            #     self.response(
+            #         {
+            #             "success": status == 200,
+            #             "count": (
+            #                 len(data)
+            #                 if isinstance(data, list)
+            #                 else 0
+            #             ),
+            #             "data": data,
+            #         },
+            #         status,
+            #     )
+
+            #     return
+
             if path == "/api/stocks":
 
+                query = parse_qs(parsed.query)
+
+                page = int(query.get("page", ["0"])[0])
+                size = int(query.get("size", ["20"])[0])
+
+                if page < 0:
+                    self.response(
+                        {
+                            "success": False,
+                            "error": "page must be >= 0",
+                        },
+                        400,
+                    )
+                    return
+
+                if size < 1 or size > 100:
+                    self.response(
+                        {
+                            "success": False,
+                            "error": "size must be between 1 and 100",
+                        },
+                        400,
+                    )
+                    return
+
+                payload_id = nepse.get_floor_payload_id()
+
                 body, status = nepse.post(
-                    "/nepse-data/today-price"
+                    "/nepse-data/today-price",
+                    {
+                        "id": payload_id,
+                        "page": page,
+                        "size": size,
+                    },
                 )
 
                 data = json_or_raw(body)
 
-                if isinstance(data, list):
+                if isinstance(data, dict) and "content" in data:
 
-                    data = [
+                    data["content"] = [
                         normalize_stock(stock)
-                        for stock in data
+                        for stock in data["content"]
                     ]
 
                 self.response(
                     {
                         "success": status == 200,
-                        "count": (
-                            len(data)
-                            if isinstance(data, list)
-                            else 0
-                        ),
+                        "page": page,
+                        "size": size,
                         "data": data,
                     },
                     status,
@@ -2222,36 +2281,62 @@ class Handler(BaseHTTPRequestHandler):
             # TODAY PRICE
             # ------------------------------------------------
 
+            # if path == "/api/today-price":
+
+            #     response, status = nepse.post(
+            #         "/nepse-data/today-price",
+            #         body,
+            #     )
+
+            #     data = json_or_raw(response)
+
+            #     if isinstance(data, list):
+
+            #         data = [
+            #             normalize_stock(stock)
+            #             for stock in data
+            #         ]
+
+            #     self.response(
+            #         {
+            #             "success": status == 200,
+            #             "count": (
+            #                 len(data)
+            #                 if isinstance(data, list)
+            #                 else 0
+            #             ),
+            #             "data": data,
+            #         },
+            #         status,
+            #     )
+
+            #     return
+            
+
             if path == "/api/today-price":
 
-                response, status = nepse.post(
-                    "/nepse-data/today-price",
-                    body,
-                )
+                    response, status = nepse.post(
+                        "/nepse-data/today-price",
+                        body,
+                    )
 
-                data = json_or_raw(response)
+                    data = json_or_raw(response)
 
-                if isinstance(data, list):
+                    if isinstance(data, dict) and "content" in data:
+                        data["content"] = [
+                            normalize_stock(stock)
+                            for stock in data["content"]
+                        ]
 
-                    data = [
-                        normalize_stock(stock)
-                        for stock in data
-                    ]
+                    self.response(
+                        {
+                            "success": status == 200,
+                            "data": data,
+                        },
+                        status,
+                    )
 
-                self.response(
-                    {
-                        "success": status == 200,
-                        "count": (
-                            len(data)
-                            if isinstance(data, list)
-                            else 0
-                        ),
-                        "data": data,
-                    },
-                    status,
-                )
-
-                return
+                    return
 
             # ------------------------------------------------
             # FLOORSHEET
