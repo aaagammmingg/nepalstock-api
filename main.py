@@ -29,8 +29,8 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 
-# NEPSE seems to ignore size and returns 20 per page, but we keep it for compatibility
-NEPSE_PAGE_SIZE = 100
+# Try a very large page size to fetch all stocks in one request
+NEPSE_PAGE_SIZE = 500
 MAX_STOCK_PAGES = 100   # safety limit
 STOCK_CACHE_TTL = 60
 
@@ -384,10 +384,9 @@ class Nepse:
         return response.text, response.status_code
 
     # ---------- Fetch one page ----------
-    def get_stock_page(self, page=0, size=100):
+    def get_stock_page(self, page=0, size=500):
         """
         Fetch one page from NEPSE today-price.
-        Note: NEPSE may ignore the `size` parameter and always return 20.
         """
         payload_id = self.get_floor_payload_id()
         body, status = self.post(
@@ -401,11 +400,11 @@ class Nepse:
             raise RuntimeError(f"Unexpected today-price response on page {page}")
         return data
 
-    # ---------- Fetch all pages (robust while loop) ----------
-    def fetch_all_pages(self, page_size=20, force_refresh=False):
+    # ---------- Fetch all pages (try single large page first) ----------
+    def fetch_all_pages(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
         """
-        Fetch every page of stocks from NEPSE.
-        Continues fetching until an empty page is returned.
+        Attempt to fetch all stocks in one page by using a large `size`.
+        If that fails (returns only 20), fall back to looping but detect duplicates.
         """
         with self._cache_lock:
             if not force_refresh and self._stock_cache is not None:
@@ -417,63 +416,97 @@ class Nepse:
                         "total_fetched": len(self._stock_cache)
                     }
 
-        all_stocks = []
-        stock_map = {}      # deduplicate by symbol
-        raw_first_page = None
-        page = 0
+        # First, try to fetch all with a large page size
+        print(f"Fetching NEPSE stocks with page_size={page_size} (attempting single page)...")
+        first_data = self.get_stock_page(page=0, size=page_size)
+        content = first_data.get("content")
+        if content is None:
+            content = first_data.get("data")
+        if content is None:
+            content = first_data.get("items")
+        if not isinstance(content, list):
+            content = []
 
-        while page < MAX_STOCK_PAGES:
-            print(f"Fetching NEPSE stock page {page} (size={page_size})...")
-            data = self.get_stock_page(page=page, size=page_size)
+        total_elements = first_data.get("totalElements")
+        total_pages = first_data.get("totalPages")
 
-            if page == 0:
-                raw_first_page = data
+        print(f"  Page 0: {len(content)} items, totalElements={total_elements}, totalPages={total_pages}")
 
-            # Extract content – try common keys
-            content = data.get("content")
-            if content is None:
-                content = data.get("data")
-            if content is None:
-                content = data.get("items")
-            if content is None:
-                content = data.get("results")
-            if not isinstance(content, list):
-                content = []
+        # If we got all stocks in one page (or close), we're done
+        if total_elements is not None and len(content) >= total_elements:
+            final_stocks = content
+            print(f"Fetched all {len(final_stocks)} stocks in one page.")
+            # Update cache
+            with self._cache_lock:
+                self._stock_cache = final_stocks
+                self._stock_cache_time = time.time()
+            return {
+                "stocks": final_stocks,
+                "raw_first_page": first_data,
+                "total_fetched": len(final_stocks)
+            }
 
-            print(f"  Page {page}: {len(content)} items")
-
-            # If the page is empty, we've reached the end
-            if not content:
-                break
-
-            # Add stocks to dedup map
+        # If we got fewer, but total_pages > 1, pagination might work.
+        # Try looping with the same page_size.
+        if total_pages is not None and total_pages > 1:
+            print(f"Attempting to fetch all {total_pages} pages with page_size={page_size}...")
+            stock_map = {}
+            # Add first page
             for stock in content:
                 sym = extract_symbol(stock)
                 if sym:
                     stock_map[sym] = stock
                 else:
-                    all_stocks.append(stock)  # fallback
+                    stock_map[f"__no_symbol_{id(stock)}"] = stock
 
-            page += 1
+            for page in range(1, total_pages):
+                print(f"  Fetching page {page}...")
+                data = self.get_stock_page(page=page, size=page_size)
+                page_content = data.get("content")
+                if page_content is None:
+                    page_content = data.get("data")
+                if page_content is None:
+                    page_content = data.get("items")
+                if not isinstance(page_content, list):
+                    page_content = []
+                print(f"    Page {page}: {len(page_content)} items")
+                for stock in page_content:
+                    sym = extract_symbol(stock)
+                    if sym:
+                        stock_map[sym] = stock
+                    else:
+                        stock_map[f"__no_symbol_{id(stock)}"] = stock
+                # If we have enough, break
+                if total_elements is not None and len(stock_map) >= total_elements:
+                    break
 
-        if page >= MAX_STOCK_PAGES:
-            print("WARNING: reached maximum page limit.")
+            final_stocks = list(stock_map.values())
+            print(f"Fetched {len(final_stocks)} unique stocks across {page+1} pages.")
+            # Update cache
+            with self._cache_lock:
+                self._stock_cache = final_stocks
+                self._stock_cache_time = time.time()
+            return {
+                "stocks": final_stocks,
+                "raw_first_page": first_data,
+                "total_fetched": len(final_stocks)
+            }
 
-        final_stocks = list(stock_map.values()) + all_stocks
-        print(f"Total unique stocks fetched: {len(final_stocks)}")
-
-        # Update cache
+        # If we still have only 20 and totalPages is 1 or missing,
+        # pagination is likely broken. Try to detect duplicates and warn.
+        # For now, just return what we have.
+        print("WARNING: Unable to fetch more than one page. Only returning first page.")
+        final_stocks = content
         with self._cache_lock:
             self._stock_cache = final_stocks
             self._stock_cache_time = time.time()
-
         return {
             "stocks": final_stocks,
-            "raw_first_page": raw_first_page,
+            "raw_first_page": first_data,
             "total_fetched": len(final_stocks)
         }
 
-    def get_all_stocks(self, page_size=20, force_refresh=False):
+    def get_all_stocks(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
         result = self.fetch_all_pages(page_size, force_refresh)
         return result["stocks"]
 
@@ -588,7 +621,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": False, "error": "size must be between 1 and 100"}, 400)
                     return
 
-                all_stocks = nepse.get_all_stocks(page_size=20)  # NEPSE uses 20 per page
+                all_stocks = nepse.get_all_stocks()
                 matches = [s for s in all_stocks if stock_matches_query(s, q)]
                 total = len(matches)
                 start = page * size
@@ -635,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": True, "page": page, "size": size, "data": data})
                     return
 
-                all_stocks = nepse.get_all_stocks(page_size=20)
+                all_stocks = nepse.get_all_stocks()
                 matches = []
                 for s in all_stocks:
                     sym = str(extract_symbol(s) or "").lower()
