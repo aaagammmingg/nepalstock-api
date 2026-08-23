@@ -2540,11 +2540,12 @@
 
 
 
+
+
 import datetime as dt
 import json
 import os
 import threading
-import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -2571,13 +2572,13 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 
-# Number of stocks requested from NEPSE per upstream page.
-# 100 means 344 stocks normally require only 4 requests.
-UPSTREAM_PAGE_SIZE = 100
+# NEPSE currently has around 344 securities.
+# 100 is kept below the API's usual maximum page size.
+NEPSE_PAGE_SIZE = 100
 
-# Search cache lifetime.
-# This prevents every search request from making 4+ NEPSE calls.
-SEARCH_CACHE_SECONDS = 30
+# Safety limit so a broken NEPSE pagination response
+# cannot create an infinite loop.
+MAX_STOCK_PAGES = 100
 
 
 # ============================================================
@@ -2625,17 +2626,85 @@ def first_present(mapping, *keys):
 
     Unlike `a or b`, this preserves valid values such as 0.
     """
+
     for key in keys:
+
         if key in mapping and mapping[key] is not None:
             return mapping[key]
 
     return None
 
 
+def matches_stock(
+    stock,
+    symbol=None,
+    security_name=None,
+):
+    """
+    Match a stock against symbol and/or securityName.
+
+    Matching is case-insensitive and uses partial matching.
+
+    Examples:
+
+        symbol=NGPL
+        symbol=ngpl
+
+        securityName=bank
+        securityName=development bank
+    """
+
+    symbol = (
+        str(symbol or "")
+        .strip()
+        .lower()
+    )
+
+    security_name = (
+        str(security_name or "")
+        .strip()
+        .lower()
+    )
+
+    if not symbol and not security_name:
+        return True
+
+    stock_symbol = str(
+        first_present(
+            stock,
+            "symbol",
+        ) or ""
+    ).lower()
+
+    stock_security_name = str(
+        first_present(
+            stock,
+            "securityName",
+            "companyName",
+            "securityNameNepali",
+        ) or ""
+    ).lower()
+
+    symbol_match = True
+    security_name_match = True
+
+    if symbol:
+        symbol_match = symbol in stock_symbol
+
+    if security_name:
+        security_name_match = (
+            security_name in stock_security_name
+        )
+
+    # If both are supplied, BOTH must match.
+    return symbol_match and security_name_match
+
+
 def normalize_stock(stock):
     """
-    Convert NEPSE stock response into the public API format.
+    Convert NEPSE stock object into a smaller consistent object.
     """
+
     if not isinstance(stock, dict):
         return stock
 
@@ -2656,8 +2725,6 @@ def normalize_stock(stock):
             stock,
             "lastTradedPrice",
             "ltp",
-            "closePrice",
-            "closingPrice",
         ),
 
         "open": first_present(
@@ -2682,7 +2749,6 @@ def normalize_stock(stock):
             stock,
             "previousClose",
             "previousClosingPrice",
-            "previousClosePrice",
         ),
 
         "change": first_present(
@@ -2719,42 +2785,15 @@ def normalize_stock(stock):
     }
 
 
-def stock_matches_query(stock, query):
+def safe_int(value, default=None):
     """
-    Search BOTH symbol and securityName.
-
-    Example:
-        ACLBSL
-        bank
-        agricultural
-        aarambha
+    Safely convert a value to int.
     """
 
-    query = str(query or "").strip().lower()
-
-    if not query:
-        return False
-
-    symbol = str(
-        first_present(
-            stock,
-            "symbol",
-        ) or ""
-    ).lower()
-
-    security_name = str(
-        first_present(
-            stock,
-            "securityName",
-            "companyName",
-            "securityNameNepali",
-        ) or ""
-    ).lower()
-
-    return (
-        query in symbol
-        or query in security_name
-    )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ============================================================
@@ -2780,7 +2819,11 @@ class TokenParser:
             )
         )
 
-    def invoke(self, function_name, args):
+    def invoke(
+        self,
+        function_name,
+        args,
+    ):
 
         result = self.runtime.invocate(
             self.wasm_module,
@@ -2790,14 +2833,21 @@ class TokenParser:
 
         if not result:
             raise RuntimeError(
-                f"WASM function returned no value: "
+                "WASM function returned no value: "
                 f"{function_name}"
             )
 
         return int(result[0])
 
     @staticmethod
-    def remove_indexes(token, indexes, token_name):
+    def remove_indexes(
+        token,
+        indexes,
+        token_name,
+    ):
+        """
+        Remove characters at supplied indexes.
+        """
 
         if not isinstance(token, str):
             raise TypeError(
@@ -2814,8 +2864,9 @@ class TokenParser:
             for i in indexes
         ):
             raise ValueError(
-                f"{token_name}: WASM produced an invalid "
-                f"token index. token length={len(token)}, "
+                f"{token_name}: WASM produced an "
+                f"invalid token index. "
+                f"token length={len(token)}, "
                 f"indexes={indexes}"
             )
 
@@ -2827,12 +2878,18 @@ class TokenParser:
 
         chars = list(token)
 
-        for index in sorted(indexes, reverse=True):
+        for index in sorted(
+            indexes,
+            reverse=True,
+        ):
             del chars[index]
 
         return "".join(chars)
 
-    def parse_token_response(self, token):
+    def parse_token_response(
+        self,
+        token,
+    ):
 
         required = [
             "salt1",
@@ -2896,10 +2953,12 @@ class TokenParser:
             ),
         ]
 
-        parsed_access_token = self.remove_indexes(
-            access_token,
-            access_indexes,
-            "accessToken",
+        parsed_access_token = (
+            self.remove_indexes(
+                access_token,
+                access_indexes,
+                "accessToken",
+            )
         )
 
         # ----------------------------------------------------
@@ -2933,10 +2992,12 @@ class TokenParser:
             ),
         ]
 
-        parsed_refresh_token = self.remove_indexes(
-            refresh_token,
-            refresh_indexes,
-            "refreshToken",
+        parsed_refresh_token = (
+            self.remove_indexes(
+                refresh_token,
+                refresh_indexes,
+                "refreshToken",
+            )
         )
 
         return (
@@ -2964,15 +3025,6 @@ class Nepse:
         self.payload_id = None
 
         self.lock = threading.RLock()
-
-        # ----------------------------------------------------
-        # SEARCH CACHE
-        # ----------------------------------------------------
-
-        self.stock_cache = None
-        self.stock_cache_time = 0
-
-        self.stock_cache_lock = threading.RLock()
 
     # ========================================================
     # AUTHENTICATION
@@ -3003,15 +3055,19 @@ class Nepse:
                     f"missing {key}"
                 )
 
-            value = int(token_response[key])
+            value = int(
+                token_response[key]
+            )
 
             token_response[key] = value
+
             salts.append(value)
 
-        access_token, refresh_token = (
-            self.token_parser.parse_token_response(
-                token_response
-            )
+        (
+            access_token,
+            refresh_token,
+        ) = self.token_parser.parse_token_response(
+            token_response
         )
 
         if not access_token:
@@ -3020,11 +3076,20 @@ class Nepse:
             )
 
         with self.lock:
-            self.salts = salts
-            self.access_token = access_token
-            self.refresh_token = refresh_token
 
-        print("NEPSE authentication successful.")
+            self.salts = salts
+
+            self.access_token = (
+                access_token
+            )
+
+            self.refresh_token = (
+                refresh_token
+            )
+
+        print(
+            "NEPSE authentication successful."
+        )
 
     def get_token(self):
 
@@ -3041,6 +3106,7 @@ class Nepse:
     def reset_token(self):
 
         with self.lock:
+
             self.access_token = None
             self.refresh_token = None
             self.salts = []
@@ -3051,11 +3117,15 @@ class Nepse:
 
     def get_headers(self):
 
-        access_token, _ = self.get_token()
+        access_token, _ = (
+            self.get_token()
+        )
 
         return {
             **session.headers,
-            "Authorization": f"Salter {access_token}",
+            "Authorization": (
+                f"Salter {access_token}"
+            ),
         }
 
     # ========================================================
@@ -3084,6 +3154,7 @@ class Nepse:
         )
 
         if response.status_code != 401:
+
             return (
                 response.text,
                 response.status_code,
@@ -3117,7 +3188,8 @@ class Nepse:
         with self.lock:
 
             if (
-                self.payload_date == current_date
+                self.payload_date
+                == current_date
                 and self.payload_id is not None
             ):
                 return self.payload_id
@@ -3128,8 +3200,9 @@ class Nepse:
 
         if status != 200:
             raise RuntimeError(
-                f"Could not get market-open. "
-                f"HTTP {status}: {response[:500]}"
+                "Could not get market-open. "
+                f"HTTP {status}: "
+                f"{response[:500]}"
             )
 
         data = json.loads(response)
@@ -3141,17 +3214,22 @@ class Nepse:
 
         if "id" not in data:
             raise RuntimeError(
-                "market-open response does not contain id"
+                "market-open response does not "
+                "contain id"
             )
 
-        dummy_id = int(data["id"])
+        dummy_id = int(
+            data["id"]
+        )
 
         if dummy_id < 0:
             raise RuntimeError(
-                f"Invalid NEPSE payload id: {dummy_id}"
+                f"Invalid NEPSE payload id: "
+                f"{dummy_id}"
             )
 
         with self.lock:
+
             self.payload_id = dummy_id
             self.payload_date = current_date
 
@@ -3165,30 +3243,36 @@ class Nepse:
     def get_dummy_data():
 
         return [
-            147, 117, 239, 143, 157, 312, 161, 612,
-            512, 804, 411, 527, 170, 511, 421, 667,
-            764, 621, 301, 106, 133, 793, 411, 511,
-            312, 423, 344, 346, 653, 758, 342, 222,
-            236, 811, 711, 611, 122, 447, 128, 199,
-            183, 135, 489, 703, 800, 745, 152, 863,
-            134, 211, 142, 564, 375, 793, 212, 153,
-            138, 153, 648, 611, 151, 649, 318, 143,
-            117, 756, 119, 141, 717, 113, 112, 146,
-            162, 660, 693, 261, 362, 354, 251, 641,
-            157, 178, 631, 192, 734, 445, 192, 883,
-            187, 122, 591, 731, 852, 384, 565, 596,
+            147, 117, 239, 143, 157, 312,
+            161, 612, 512, 804, 411, 527,
+            170, 511, 421, 667, 764, 621,
+            301, 106, 133, 793, 411, 511,
+            312, 423, 344, 346, 653, 758,
+            342, 222, 236, 811, 711, 611,
+            122, 447, 128, 199, 183, 135,
+            489, 703, 800, 745, 152, 863,
+            134, 211, 142, 564, 375, 793,
+            212, 153, 138, 153, 648, 611,
+            151, 649, 318, 143, 117, 756,
+            119, 141, 717, 113, 112, 146,
+            162, 660, 693, 261, 362, 354,
+            251, 641, 157, 178, 631, 192,
+            734, 445, 192, 883, 187, 122,
+            591, 731, 852, 384, 565, 596,
             451, 772, 624, 691,
         ]
 
     def _payload_base(self):
 
         dummy_id = self.get_dummy_id()
+
         data = self.get_dummy_data()
 
         if dummy_id >= len(data):
+
             raise RuntimeError(
-                f"NEPSE payload id {dummy_id} is outside "
-                f"the payload table "
+                f"NEPSE payload id {dummy_id} "
+                f"is outside payload table "
                 f"(size={len(data)})"
             )
 
@@ -3274,16 +3358,26 @@ class Nepse:
     # POST
     # ========================================================
 
-    def post(self, path, body=None):
+    def post(
+        self,
+        path,
+        body=None,
+    ):
 
         url = self.build_url(path)
 
+        # Generate protected payload only
+        # when caller didn't supply body.
         if body is None:
 
             if (
-                "/nepse-data/floorsheet" in path
-                or "/nepse-data/today-price" in path
+                "/nepse-data/floorsheet"
+                in path
+                or
+                "/nepse-data/today-price"
+                in path
             ):
+
                 payload_id = (
                     self.get_floor_payload_id()
                 )
@@ -3306,7 +3400,9 @@ class Nepse:
 
         headers = {
             **self.get_headers(),
-            "Content-Type": "application/json",
+            "Content-Type": (
+                "application/json"
+            ),
         }
 
         response = session.post(
@@ -3317,6 +3413,7 @@ class Nepse:
         )
 
         if response.status_code != 401:
+
             return (
                 response.text,
                 response.status_code,
@@ -3330,7 +3427,9 @@ class Nepse:
 
         headers = {
             **self.get_headers(),
-            "Content-Type": "application/json",
+            "Content-Type": (
+                "application/json"
+            ),
         }
 
         response = session.post(
@@ -3349,10 +3448,10 @@ class Nepse:
     # FETCH ONE STOCK PAGE
     # ========================================================
 
-    def fetch_stock_page(
+    def get_stock_page(
         self,
         page=0,
-        size=UPSTREAM_PAGE_SIZE,
+        size=100,
     ):
         """
         Fetch one page from NEPSE today-price.
@@ -3372,23 +3471,32 @@ class Nepse:
         )
 
         if status != 200:
+
             raise RuntimeError(
-                f"today-price failed: "
-                f"HTTP {status}: {body[:500]}"
+                f"Could not fetch stock page "
+                f"{page}. HTTP {status}: "
+                f"{body[:500]}"
             )
 
         data = json_or_raw(body)
 
         if not isinstance(data, dict):
+
             raise RuntimeError(
-                "Unexpected today-price response"
+                f"Unexpected today-price "
+                f"response on page {page}"
             )
 
-        content = data.get("content", [])
+        content = data.get(
+            "content",
+            [],
+        )
 
         if not isinstance(content, list):
+
             raise RuntimeError(
-                "today-price response has invalid content"
+                f"Invalid content on page "
+                f"{page}"
             )
 
         return data
@@ -3397,232 +3505,126 @@ class Nepse:
     # FETCH ALL STOCKS
     # ========================================================
 
-    def fetch_all_stocks(self, force=False):
+    def get_all_stocks(
+        self,
+        page_size=NEPSE_PAGE_SIZE,
+    ):
         """
-        Fetch ALL stocks from NEPSE.
+        Fetch every page from NEPSE and return
+        one combined list.
 
-        This is the important part for /api/search.
+        This is the important part for search.
 
-        We do NOT search only page 0.
-
-        We keep requesting pages until the NEPSE pagination
-        metadata says there are no more pages.
+        Search MUST NOT be performed against
+        only page 0.
         """
 
-        with self.stock_cache_lock:
+        all_stocks = []
 
-            current_time = time.time()
+        page = 0
+
+        while page < MAX_STOCK_PAGES:
+
+            print(
+                f"Fetching NEPSE stock page "
+                f"{page}..."
+            )
+
+            data = self.get_stock_page(
+                page=page,
+                size=page_size,
+            )
+
+            content = data.get(
+                "content",
+                [],
+            )
+
+            all_stocks.extend(content)
+
+            # ------------------------------------------------
+            # Determine pagination information
+            # ------------------------------------------------
+
+            total_pages = safe_int(
+                data.get("totalPages")
+            )
+
+            total_elements = safe_int(
+                data.get("totalElements")
+            )
+
+            current_page = safe_int(
+                data.get("number")
+            )
+
+            if current_page is None:
+                current_page = page
+
+            print(
+                f"NEPSE page {page}: "
+                f"{len(content)} stocks"
+            )
+
+            # ------------------------------------------------
+            # Best case:
+            # NEPSE tells us totalPages.
+            # ------------------------------------------------
 
             if (
-                not force
-                and self.stock_cache is not None
-                and (
-                    current_time
-                    - self.stock_cache_time
-                    < SEARCH_CACHE_SECONDS
-                )
+                total_pages is not None
+                and total_pages > 0
             ):
-                return self.stock_cache.copy()
-
-            print(
-                "Refreshing complete stock search cache..."
-            )
-
-            all_stocks = []
-
-            page = 0
-
-            while True:
-
-                print(
-                    f"Fetching stock page {page} "
-                    f"(size={UPSTREAM_PAGE_SIZE})..."
-                )
-
-                data = self.fetch_stock_page(
-                    page=page,
-                    size=UPSTREAM_PAGE_SIZE,
-                )
-
-                content = data.get(
-                    "content",
-                    [],
-                )
-
-                if not content:
-                    break
-
-                all_stocks.extend(content)
-
-                # ------------------------------------------------
-                # Read pagination metadata when available.
-                # ------------------------------------------------
-
-                total_pages = data.get(
-                    "totalPages"
-                )
-
-                last = data.get(
-                    "last"
-                )
-
-                number = data.get(
-                    "number",
-                    page,
-                )
-
-                response_size = data.get(
-                    "size",
-                    UPSTREAM_PAGE_SIZE,
-                )
-
-                total_elements = data.get(
-                    "totalElements"
-                )
-
-                print(
-                    f"Page {page}: "
-                    f"{len(content)} stocks"
-                )
-
-                # ------------------------------------------------
-                # Preferred stopping conditions
-                # ------------------------------------------------
-
-                if last is True:
-                    break
 
                 if (
-                    total_pages is not None
-                    and page + 1 >= int(total_pages)
+                    current_page
+                    >= total_pages - 1
                 ):
                     break
 
-                # ------------------------------------------------
-                # If totalElements is available.
-                # ------------------------------------------------
+                page += 1
+                continue
 
-                if total_elements is not None:
+            # ------------------------------------------------
+            # If totalElements is available,
+            # stop when we have enough.
+            # ------------------------------------------------
 
-                    if (
-                        len(all_stocks)
-                        >= int(total_elements)
-                    ):
-                        break
+            if (
+                total_elements is not None
+                and len(all_stocks)
+                >= total_elements
+            ):
+                break
 
-                # ------------------------------------------------
-                # Fallback:
-                # if returned page has fewer stocks than
-                # requested, this is almost certainly the
-                # final page.
-                # ------------------------------------------------
+            # ------------------------------------------------
+            # Fallback:
+            # if returned records are fewer than
+            # requested page size, we reached the end.
+            # ------------------------------------------------
 
-                if len(content) < UPSTREAM_PAGE_SIZE:
-                    break
+            if len(content) < page_size:
+                break
 
-                # ------------------------------------------------
-                # Safety:
-                # if API reports an unexpected page number,
-                # avoid looping forever.
-                # ------------------------------------------------
+            # Empty page = definitely finished.
+            if not content:
+                break
 
-                if (
-                    number is not None
-                    and int(number) != page
-                ):
-                    page = int(number) + 1
-                else:
-                    page += 1
+            page += 1
 
-                # Absolute safety limit.
-                if page > 100:
-                    print(
-                        "Stopping stock pagination at safety "
-                        "limit."
-                    )
-                    break
-
-            # ----------------------------------------------------
-            # Remove duplicate stocks by symbol.
-            # ----------------------------------------------------
-
-            unique = {}
-            without_symbol = []
-
-            for stock in all_stocks:
-
-                if not isinstance(stock, dict):
-                    continue
-
-                symbol = first_present(
-                    stock,
-                    "symbol",
-                )
-
-                if symbol:
-
-                    symbol_key = str(
-                        symbol
-                    ).strip().upper()
-
-                    unique[symbol_key] = stock
-
-                else:
-
-                    without_symbol.append(
-                        stock
-                    )
-
-            all_stocks = (
-                list(unique.values())
-                + without_symbol
-            )
+        if page >= MAX_STOCK_PAGES:
 
             print(
-                f"Stock search cache refreshed: "
-                f"{len(all_stocks)} stocks"
+                "WARNING: maximum stock page "
+                "limit reached."
             )
 
-            self.stock_cache = all_stocks
-            self.stock_cache_time = time.time()
+        print(
+            f"Fetched {len(all_stocks)} "
+            f"stocks from NEPSE."
+        )
 
-            return all_stocks.copy()
-
-    # ========================================================
-    # SEARCH ALL STOCKS
-    # ========================================================
-
-    def search_stocks(self, query):
-        """
-        Search the COMPLETE stock universe.
-
-        This is deliberately separate from the upstream
-        pagination.
-
-        Example:
-
-            query = GRDBL
-
-        If GRDBL is on upstream page 3, it will still be found.
-        """
-
-        query = str(query or "").strip()
-
-        if not query:
-            return []
-
-        all_stocks = self.fetch_all_stocks()
-
-        matches = [
-            stock
-            for stock in all_stocks
-            if stock_matches_query(
-                stock,
-                query,
-            )
-        ]
-
-        return matches
+        return all_stocks
 
 
 # ============================================================
@@ -3641,10 +3643,14 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # --------------------------------------------------------
-    # Reduce default server logging
+    # SERVER LOGGING
     # --------------------------------------------------------
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args,
+    ):
 
         print(
             "%s - %s"
@@ -3679,7 +3685,11 @@ class Handler(BaseHTTPRequestHandler):
     # RESPONSE
     # --------------------------------------------------------
 
-    def response(self, data, status=200):
+    def response(
+        self,
+        data,
+        status=200,
+    ):
 
         payload = json.dumps(
             data,
@@ -3717,7 +3727,6 @@ class Handler(BaseHTTPRequestHandler):
             BrokenPipeError,
             ConnectionResetError,
         ):
-
             pass
 
     # --------------------------------------------------------
@@ -3749,13 +3758,9 @@ class Handler(BaseHTTPRequestHandler):
 
         path = parsed.path
 
-        query = parse_qs(
-            parsed.query
-        )
-
         print(
             "GET",
-            self.path
+            self.path,
         )
 
         try:
@@ -3768,14 +3773,18 @@ class Handler(BaseHTTPRequestHandler):
 
                 self.response(
                     {
-                        "name": "Open NEPSE API",
+                        "name": (
+                            "Open NEPSE API"
+                        ),
                         "status": "running",
-                        "timezone": "Asia/Kathmandu",
-
+                        "timezone": (
+                            "Asia/Kathmandu"
+                        ),
                         "endpoints": [
                             "/api/stocks",
                             "/api/stocks/SYMBOL",
-                            "/api/search?q=SYMBOL",
+                            "/api/search?q=NGPL",
+                            "/api/search?q=bank",
                             "/api/market",
                             "/api/index",
                             "/api/status",
@@ -3790,79 +3799,33 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # ==================================================
-            # SEARCH
+            # SEARCH ALL STOCKS
             # ==================================================
 
             if path == "/api/search":
 
-                # ------------------------------------------------
-                # Accept:
-                #
-                # /api/search?q=GRDBL
-                #
-                # Also accept:
-                #
-                # /api/search?query=GRDBL
-                #
-                # /api/search?symbol=GRDBL
-                #
-                # ------------------------------------------------
-
-                search_query = (
-                    query.get(
-                        "q",
-                        [""],
-                    )[0]
+                query = parse_qs(
+                    parsed.query
                 )
 
-                if not search_query:
+                q = query.get(
+                    "q",
+                    [""],
+                )[0].strip()
 
-                    search_query = (
-                        query.get(
-                            "query",
-                            [""],
-                        )[0]
-                    )
-
-                if not search_query:
-
-                    search_query = (
-                        query.get(
-                            "symbol",
-                            [""],
-                        )[0]
-                    )
-
-                search_query = (
-                    unquote(
-                        search_query
-                    )
-                    .strip()
-                )
-
-                if not search_query:
+                if not q:
 
                     self.response(
                         {
                             "success": False,
                             "error": (
-                                "Search query is required. "
-                                "Use /api/search?q=GRDBL"
+                                "q is required"
                             ),
                         },
                         400,
                     )
 
                     return
-
-                # ------------------------------------------------
-                # Search pagination.
-                #
-                # IMPORTANT:
-                #
-                # This pagination is applied AFTER searching
-                # the entire 344-stock universe.
-                # ------------------------------------------------
 
                 try:
 
@@ -3886,7 +3849,8 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "success": False,
                             "error": (
-                                "page and size must be integers"
+                                "page and size "
+                                "must be integers"
                             ),
                         },
                         400,
@@ -3914,8 +3878,8 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "success": False,
                             "error": (
-                                "size must be between "
-                                "1 and 100"
+                                "size must be "
+                                "between 1 and 100"
                             ),
                         },
                         400,
@@ -3924,91 +3888,267 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 # ------------------------------------------------
-                # SEARCH ALL PAGES FIRST
+                # IMPORTANT:
+                # Fetch ALL NEPSE pages.
                 # ------------------------------------------------
 
-                matching_stocks = (
-                    nepse.search_stocks(
-                        search_query
+                all_stocks = (
+                    nepse.get_all_stocks(
+                        page_size=100
                     )
                 )
 
-                total = len(
-                    matching_stocks
-                )
+                search_text = q.lower()
 
                 # ------------------------------------------------
-                # SORT:
-                #
-                # Exact symbol match first,
-                # then symbol prefix,
-                # then everything else.
-                #
-                # This makes searches such as GRDBL and ACLBSL
-                # return the exact stock first.
+                # Search across ALL stocks.
                 # ------------------------------------------------
 
-                normalized_query = (
-                    search_query
-                    .lower()
-                    .strip()
-                )
+                matches = []
 
-                def search_sort_key(stock):
+                for stock in all_stocks:
+
+                    if not isinstance(
+                        stock,
+                        dict,
+                    ):
+                        continue
 
                     symbol = str(
                         first_present(
                             stock,
                             "symbol",
                         ) or ""
-                    ).lower()
+                    )
 
                     security_name = str(
                         first_present(
                             stock,
                             "securityName",
                             "companyName",
+                            "securityNameNepali",
                         ) or ""
-                    ).lower()
-
-                    if symbol == normalized_query:
-                        priority = 0
-
-                    elif symbol.startswith(
-                        normalized_query
-                    ):
-                        priority = 1
-
-                    elif normalized_query in symbol:
-                        priority = 2
-
-                    elif normalized_query in security_name:
-                        priority = 3
-
-                    else:
-                        priority = 4
-
-                    return (
-                        priority,
-                        symbol,
-                        security_name,
                     )
 
-                matching_stocks.sort(
-                    key=search_sort_key
-                )
+                    if (
+                        search_text
+                        in symbol.lower()
+                        or
+                        search_text
+                        in security_name.lower()
+                    ):
+
+                        matches.append(
+                            stock
+                        )
 
                 # ------------------------------------------------
-                # APPLY SEARCH RESULT PAGINATION
+                # PAGINATE SEARCH RESULTS
                 # ------------------------------------------------
+
+                total = len(matches)
+
+                start = (
+                    page * size
+                )
+
+                end = (
+                    start + size
+                )
+
+                paginated = matches[
+                    start:end
+                ]
 
                 total_pages = (
                     (
                         total + size - 1
-                    )
-                    // size
-                    if total
+                    ) // size
+                    if total > 0
                     else 0
+                )
+
+                self.response(
+                    {
+                        "success": True,
+                        "query": q,
+                        "page": page,
+                        "size": size,
+                        "total": total,
+                        "totalPages": (
+                            total_pages
+                        ),
+                        "hasNext": (
+                            page + 1
+                            < total_pages
+                        ),
+                        "hasPrevious": (
+                            page > 0
+                        ),
+                        "count": len(
+                            paginated
+                        ),
+                        "data": [
+                            normalize_stock(
+                                stock
+                            )
+                            for stock in paginated
+                        ],
+                    }
+                )
+
+                return
+
+            # ==================================================
+            # STOCKS WITH CROSS-PAGE FILTERING
+            # ==================================================
+
+            if path == "/api/stocks":
+
+                query = parse_qs(
+                    parsed.query
+                )
+
+                try:
+
+                    page = int(
+                        query.get(
+                            "page",
+                            ["0"],
+                        )[0]
+                    )
+
+                    size = int(
+                        query.get(
+                            "size",
+                            ["20"],
+                        )[0]
+                    )
+
+                except ValueError:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page and size "
+                                "must be integers"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if page < 0:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "page must be >= 0"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                if size < 1 or size > 100:
+
+                    self.response(
+                        {
+                            "success": False,
+                            "error": (
+                                "size must be "
+                                "between 1 and 100"
+                            ),
+                        },
+                        400,
+                    )
+
+                    return
+
+                symbol = query.get(
+                    "symbol",
+                    [""],
+                )[0].strip()
+
+                security_name = query.get(
+                    "securityName",
+                    [""],
+                )[0].strip()
+
+                # ------------------------------------------------
+                # NO FILTER:
+                # preserve normal NEPSE pagination.
+                # ------------------------------------------------
+
+                if (
+                    not symbol
+                    and not security_name
+                ):
+
+                    data = (
+                        nepse.get_stock_page(
+                            page=page,
+                            size=size,
+                        )
+                    )
+
+                    if (
+                        isinstance(
+                            data,
+                            dict,
+                        )
+                        and
+                        "content" in data
+                    ):
+
+                        data["content"] = [
+                            normalize_stock(
+                                stock
+                            )
+                            for stock
+                            in data[
+                                "content"
+                            ]
+                        ]
+
+                    self.response(
+                        {
+                            "success": True,
+                            "page": page,
+                            "size": size,
+                            "data": data,
+                        }
+                    )
+
+                    return
+
+                # ------------------------------------------------
+                # FILTER:
+                # fetch ALL pages first.
+                # ------------------------------------------------
+
+                all_stocks = (
+                    nepse.get_all_stocks(
+                        page_size=100
+                    )
+                )
+
+                matches = [
+                    stock
+                    for stock in all_stocks
+                    if matches_stock(
+                        stock,
+                        symbol,
+                        security_name,
+                    )
+                ]
+
+                total = len(
+                    matches
                 )
 
                 start = (
@@ -4019,171 +4159,44 @@ class Handler(BaseHTTPRequestHandler):
                     start + size
                 )
 
-                page_results = (
-                    matching_stocks[
-                        start:end
-                    ]
-                )
-
-                normalized_results = [
-                    normalize_stock(
-                        stock
-                    )
-                    for stock in page_results
+                paginated = matches[
+                    start:end
                 ]
 
-                has_previous = (
-                    page > 0
-                    and total_pages > 0
-                    and page < total_pages
+                total_pages = (
+                    (
+                        total + size - 1
+                    ) // size
+                    if total > 0
+                    else 0
                 )
-
-                has_next = (
-                    page + 1
-                    < total_pages
-                )
-
-                # ------------------------------------------------
-                # Out-of-range page
-                # ------------------------------------------------
 
                 self.response(
                     {
                         "success": True,
-                        "query": search_query,
                         "page": page,
                         "size": size,
-
                         "total": total,
-
-                        "totalPages": total_pages,
-
-                        "hasNext": has_next,
-
-                        "hasPrevious": has_previous,
-
+                        "totalPages": (
+                            total_pages
+                        ),
+                        "hasNext": (
+                            page + 1
+                            < total_pages
+                        ),
+                        "hasPrevious": (
+                            page > 0
+                        ),
                         "count": len(
-                            normalized_results
+                            paginated
                         ),
-
-                        "data": normalized_results,
+                        "data": [
+                            normalize_stock(
+                                stock
+                            )
+                            for stock in paginated
+                        ],
                     }
-                )
-
-                return
-
-            # ==================================================
-            # STOCKS
-            # ==================================================
-
-            if path == "/api/stocks":
-
-                try:
-
-                    page = int(
-                        query.get(
-                            "page",
-                            ["0"],
-                        )[0]
-                    )
-
-                    size = int(
-                        query.get(
-                            "size",
-                            ["20"],
-                        )[0]
-                    )
-
-                except ValueError:
-
-                    self.response(
-                        {
-                            "success": False,
-                            "error": (
-                                "page and size must be integers"
-                            ),
-                        },
-                        400,
-                    )
-
-                    return
-
-                if page < 0:
-
-                    self.response(
-                        {
-                            "success": False,
-                            "error": (
-                                "page must be >= 0"
-                            ),
-                        },
-                        400,
-                    )
-
-                    return
-
-                if size < 1 or size > 100:
-
-                    self.response(
-                        {
-                            "success": False,
-                            "error": (
-                                "size must be between "
-                                "1 and 100"
-                            ),
-                        },
-                        400,
-                    )
-
-                    return
-
-                # ------------------------------------------------
-                # IMPORTANT:
-                #
-                # /api/stocks remains normal NEPSE pagination.
-                #
-                # For searching, use /api/search instead.
-                # ------------------------------------------------
-
-                body, status = nepse.post(
-                    "/nepse-data/today-price",
-                    {
-                        "id": (
-                            nepse.get_floor_payload_id()
-                        ),
-                        "page": page,
-                        "size": size,
-                    },
-                )
-
-                data = json_or_raw(
-                    body
-                )
-
-                if (
-                    isinstance(data, dict)
-                    and "content" in data
-                ):
-
-                    data["content"] = [
-                        normalize_stock(
-                            stock
-                        )
-                        for stock in data[
-                            "content"
-                        ]
-                    ]
-
-                self.response(
-                    {
-                        "success": (
-                            status == 200
-                        ),
-                        "page": page,
-                        "size": size,
-                        "data": data,
-                    },
-                    status,
                 )
 
                 return
@@ -4211,7 +4224,8 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "success": False,
                             "error": (
-                                "Invalid stock symbol"
+                                "Invalid stock "
+                                "symbol"
                             ),
                         },
                         400,
@@ -4375,9 +4389,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 self.response(
-                    json_or_raw(
-                        body
-                    ),
+                    json_or_raw(body),
                     status,
                 )
 
@@ -4444,10 +4456,14 @@ class Handler(BaseHTTPRequestHandler):
 
         print(
             "POST",
-            self.path
+            self.path,
         )
 
         try:
+
+            # ------------------------------------------------
+            # CONTENT LENGTH
+            # ------------------------------------------------
 
             content_length_header = (
                 self.headers.get(
@@ -4458,8 +4474,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
 
                 content_length = int(
-                    content_length_header
-                    or 0
+                    content_length_header or 0
                 )
 
             except ValueError:
@@ -4468,7 +4483,8 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "success": False,
                         "error": (
-                            "Invalid Content-Length"
+                            "Invalid "
+                            "Content-Length"
                         ),
                     },
                     400,
@@ -4482,7 +4498,8 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "success": False,
                         "error": (
-                            "Invalid request body"
+                            "Invalid request "
+                            "body"
                         ),
                     },
                     400,
@@ -4491,6 +4508,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             body = None
+
+            # ------------------------------------------------
+            # READ BODY
+            # ------------------------------------------------
 
             if content_length:
 
@@ -4548,14 +4569,16 @@ class Handler(BaseHTTPRequestHandler):
                         data,
                         dict,
                     )
-                    and "content" in data
+                    and
+                    "content" in data
                 ):
 
                     data["content"] = [
                         normalize_stock(
                             stock
                         )
-                        for stock in data[
+                        for stock
+                        in data[
                             "content"
                         ]
                     ]
@@ -4607,7 +4630,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "success": False,
                     "error": (
-                        "POST endpoint not found"
+                        "POST endpoint "
+                        "not found"
                     ),
                 },
                 404,
@@ -4661,12 +4685,14 @@ class ReusableThreadingHTTPServer(
 
 def main():
 
-    server = ReusableThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            PORT,
-        ),
-        Handler,
+    server = (
+        ReusableThreadingHTTPServer(
+            (
+                "0.0.0.0",
+                PORT,
+            ),
+            Handler,
+        )
     )
 
     print()
@@ -4688,43 +4714,33 @@ def main():
     print()
 
     print(
-        f"Stocks: {API_URL}/api/stocks"
+        f"Stocks: "
+        f"{API_URL}/api/stocks"
     )
 
     print(
-        f"Search: {API_URL}/api/search?q=GRDBL"
+        f"Search: "
+        f"{API_URL}/api/search?q=NGPL"
     )
 
     print(
-        f"Market: {API_URL}/api/market"
+        f"Market: "
+        f"{API_URL}/api/market"
     )
 
     print(
-        f"Index:  {API_URL}/api/index"
+        f"Index:  "
+        f"{API_URL}/api/index"
     )
 
     print(
-        f"Status: {API_URL}/api/status"
+        f"Status: "
+        f"{API_URL}/api/status"
     )
 
     print(
-        f"Today:  {API_URL}/api/today-price"
-    )
-
-    print(
-        f"Floor:  {API_URL}/api/floorsheet"
-    )
-
-    print()
-
-    print(
-        f"Search cache: "
-        f"{SEARCH_CACHE_SECONDS} seconds"
-    )
-
-    print(
-        f"Upstream page size: "
-        f"{UPSTREAM_PAGE_SIZE}"
+        f"Today:  "
+        f"{API_URL}/api/today-price"
     )
 
     print()
@@ -4754,5 +4770,11 @@ def main():
         server.server_close()
 
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
     main()
+
+
