@@ -3,7 +3,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import urlparse
 
 import requests
 import pywasm
@@ -14,29 +14,32 @@ import pytz
 # CONFIG
 # ============================================================
 
+BASE_URL = "https://www.nepalstock.com.np"
+NEPSE_API = f"{BASE_URL}/api/nots"
+
+PORT = int(os.getenv("PORT", "5000"))
+
 TZ_NP = pytz.timezone("Asia/Kathmandu")
 
-BASE_URL = "https://www.nepalstock.com.np"
-API_BASE_URL = f"{BASE_URL}/api/nots"
 
-PORT = int(os.environ.get("PORT", 5000))
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
-# Keep one requests session.
-SESSION = requests.Session()
+session = requests.Session()
 
-# Do NOT use verify=False.
-SESSION.verify = True
-
-SESSION.headers.update({
+session.headers.update({
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
-        "Gecko/20100101 Firefox/128.0"
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/128.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": BASE_URL + "/",
-    "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
 })
 
 
@@ -46,20 +49,28 @@ SESSION.headers.update({
 
 class TokenParser:
 
-    def __init__(self, wasm_file="css.wasm"):
+    def __init__(self):
+
         self.runtime = pywasm.core.Runtime()
-        self.wasm_module = self.runtime.instance_from_file(wasm_file)
 
-    def parse_token_response(self, token_response):
+        self.wasm_module = (
+            self.runtime.instance_from_file("css.wasm")
+        )
 
-        s1 = int(token_response["salt1"])
-        s2 = int(token_response["salt2"])
-        s3 = int(token_response["salt3"])
-        s4 = int(token_response["salt4"])
-        s5 = int(token_response["salt5"])
+    def parse_token_response(self, token):
 
-        access_token = token_response["accessToken"]
-        refresh_token = token_response["refreshToken"]
+        s1 = int(token["salt1"])
+        s2 = int(token["salt2"])
+        s3 = int(token["salt3"])
+        s4 = int(token["salt4"])
+        s5 = int(token["salt5"])
+
+        access_token = token["accessToken"]
+        refresh_token = token["refreshToken"]
+
+        # ----------------------------------------------------
+        # ACCESS TOKEN
+        # ----------------------------------------------------
 
         n = self.runtime.invocate(
             self.wasm_module,
@@ -91,6 +102,19 @@ class TokenParser:
             [s1, s2, s4, s3, s5]
         )[0]
 
+        parsed_access_token = (
+            access_token[:n]
+            + access_token[n + 1:l]
+            + access_token[l + 1:o]
+            + access_token[o + 1:p]
+            + access_token[p + 1:q]
+            + access_token[q + 1:]
+        )
+
+        # ----------------------------------------------------
+        # REFRESH TOKEN
+        # ----------------------------------------------------
+
         a = self.runtime.invocate(
             self.wasm_module,
             "cdx",
@@ -121,15 +145,6 @@ class TokenParser:
             [s2, s1, s4, s3, s5]
         )[0]
 
-        parsed_access_token = (
-            access_token[:n]
-            + access_token[n + 1:l]
-            + access_token[l + 1:o]
-            + access_token[o + 1:p]
-            + access_token[p + 1:q]
-            + access_token[q + 1:]
-        )
-
         parsed_refresh_token = (
             refresh_token[:a]
             + refresh_token[a + 1:b]
@@ -139,7 +154,10 @@ class TokenParser:
             + refresh_token[e + 1:]
         )
 
-        return parsed_access_token, parsed_refresh_token
+        return (
+            parsed_access_token,
+            parsed_refresh_token
+        )
 
 
 # ============================================================
@@ -150,32 +168,27 @@ class Nepse:
 
     def __init__(self):
 
-        self.token_parser = TokenParser("css.wasm")
+        self.token_parser = TokenParser()
 
         self.access_token = None
         self.refresh_token = None
+
+        self.salts = []
 
         self.payload_day = None
         self.payload_id = None
 
         self.lock = threading.Lock()
 
-    # --------------------------------------------------------
-    # TOKEN
-    # --------------------------------------------------------
+    # ========================================================
+    # AUTHENTICATION
+    # ========================================================
 
-    def get_token(self):
+    def authenticate(self):
 
-        with self.lock:
+        print("Authenticating with NEPSE...")
 
-            if self.access_token:
-                return self.access_token, self.refresh_token
-
-            return self._authenticate()
-
-    def _authenticate(self):
-
-        response = SESSION.get(
+        response = session.get(
             f"{BASE_URL}/api/authenticate/prove",
             timeout=20
         )
@@ -184,6 +197,18 @@ class Nepse:
 
         token_response = response.json()
 
+        self.salts = []
+
+        for i in range(1, 6):
+
+            value = int(
+                token_response[f"salt{i}"]
+            )
+
+            token_response[f"salt{i}"] = value
+
+            self.salts.append(value)
+
         (
             self.access_token,
             self.refresh_token
@@ -191,111 +216,89 @@ class Nepse:
             token_response
         )
 
-        return self.access_token, self.refresh_token
+        print("NEPSE authentication successful.")
+
+    def get_token(self):
+
+        with self.lock:
+
+            if not self.access_token:
+                self.authenticate()
+
+            return (
+                self.access_token,
+                self.refresh_token
+            )
 
     def reset_token(self):
 
         with self.lock:
+
             self.access_token = None
             self.refresh_token = None
 
-    # --------------------------------------------------------
+    # ========================================================
     # HEADERS
-    # --------------------------------------------------------
+    # ========================================================
 
-    def auth_headers(self):
+    def get_headers(self):
 
         access_token, _ = self.get_token()
 
         return {
-            **SESSION.headers,
+            **session.headers,
             "Authorization": f"Salter {access_token}",
         }
 
-    # --------------------------------------------------------
-    # GET
-    # --------------------------------------------------------
+    # ========================================================
+    # URL
+    # ========================================================
+
+    def build_url(self, path):
+
+        path = path.lstrip("/")
+
+        return f"{NEPSE_API}/{path}"
+
+    # ========================================================
+    # GET REQUEST
+    # ========================================================
 
     def get(self, path):
 
         url = self.build_url(path)
 
-        response = SESSION.get(
+        response = session.get(
             url,
-            headers=self.auth_headers(),
+            headers=self.get_headers(),
             timeout=20
         )
 
-        # Token might have expired.
+        # Try once again if token expired.
         if response.status_code == 401:
+
+            print("Token expired. Re-authenticating...")
 
             self.reset_token()
 
-            response = SESSION.get(
+            response = session.get(
                 url,
-                headers=self.auth_headers(),
+                headers=self.get_headers(),
                 timeout=20
             )
 
-        return response.text, response.status_code
-
-    # --------------------------------------------------------
-    # POST
-    # --------------------------------------------------------
-
-    def post(self, path, body=None):
-
-        url = self.build_url(path)
-
-        if body is None:
-            body = {
-                "id": self.get_post_payload_id(path)
-            }
-
-        headers = {
-            **self.auth_headers(),
-            "Content-Type": "application/json",
-        }
-
-        response = SESSION.post(
-            url,
-            headers=headers,
-            json=body,
-            timeout=30
+        return (
+            response.text,
+            response.status_code
         )
 
-        if response.status_code == 401:
-
-            self.reset_token()
-
-            headers = {
-                **self.auth_headers(),
-                "Content-Type": "application/json",
-            }
-
-            response = SESSION.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=30
-            )
-
-        return response.text, response.status_code
-
-    # --------------------------------------------------------
-    # URL
-    # --------------------------------------------------------
-
-    def build_url(self, path):
-
-        if path.startswith("/"):
-            path = path[1:]
-
-        return f"{API_BASE_URL}/{path}"
-
-    # --------------------------------------------------------
-    # PAYLOAD
-    # --------------------------------------------------------
+    # ========================================================
+    # DUMMY ID
+    #
+    # IMPORTANT:
+    # This is NOT stock-price dummy data.
+    # It is used by NEPSE's protected POST payload mechanism.
+    # ========================================================
 
     def get_dummy_id(self):
 
@@ -309,16 +312,26 @@ class Nepse:
         )
 
         if status != 200:
+
             raise RuntimeError(
-                f"Unable to get market-open: {status}"
+                f"Could not get market-open. "
+                f"HTTP {status}"
             )
 
         data = json.loads(response)
 
-        self.payload_id = data["id"]
+        self.payload_id = int(data["id"])
+
         self.payload_day = now.day
 
         return self.payload_id
+
+    # ========================================================
+    # NEPSE PAYLOAD DATA
+    #
+    # Required by the current protected POST mechanism.
+    # This is NOT market data.
+    # ========================================================
 
     def get_dummy_data(self):
 
@@ -338,75 +351,260 @@ class Nepse:
             451, 772, 624, 691
         ]
 
-    def get_post_payload_id(self, path):
+    # ========================================================
+    # NORMAL POST PAYLOAD
+    # ========================================================
+
+    def get_post_payload_id(self):
 
         dummy_id = self.get_dummy_id()
 
         now = datetime.datetime.now(TZ_NP)
 
-        dummy = self.get_dummy_data()
-
-        # Index graph
-        if "/graph/index/" in path:
-
-            e = (
-                dummy[dummy_id]
-                + dummy_id
-                + 2 * now.day
-            )
-
-            # Need current salts.
-            self.get_token()
-
-            # This reproduces your existing logic.
-            # Your original code uses the salt array
-            # internally, so preserve that logic if your
-            # current css.wasm/token implementation requires it.
-
-            return e
-
-        # Floorsheet / today's price
-        if (
-            "/nepse-data/floorsheet" in path
-            or "/nepse-data/today-price" in path
-        ):
-
-            e = (
-                dummy[dummy_id]
-                + dummy_id
-                + 2 * now.day
-            )
-
-            return e
+        data = self.get_dummy_data()
 
         return (
-            dummy[dummy_id]
+            data[dummy_id]
             + dummy_id
             + 2 * now.day
         )
 
+    # ========================================================
+    # FLOORSHEET / TODAY PRICE PAYLOAD
+    # ========================================================
+
+    def get_floor_payload_id(self):
+
+        dummy_id = self.get_dummy_id()
+
+        now = datetime.datetime.now(TZ_NP)
+
+        data = self.get_dummy_data()
+
+        e = (
+            data[dummy_id]
+            + dummy_id
+            + 2 * now.day
+        )
+
+        salt_index = (
+            1 if e % 10 < 4
+            else 3
+        )
+
+        return (
+            e
+            + self.salts[salt_index] * now.day
+            - self.salts[salt_index - 1]
+        )
+
+    # ========================================================
+    # INDEX GRAPH PAYLOAD
+    # ========================================================
+
+    def get_index_payload_id(self):
+
+        dummy_id = self.get_dummy_id()
+
+        now = datetime.datetime.now(TZ_NP)
+
+        data = self.get_dummy_data()
+
+        e = (
+            data[dummy_id]
+            + dummy_id
+            + 2 * now.day
+        )
+
+        salt_index = (
+            3 if e % 10 < 5
+            else 1
+        )
+
+        return (
+            e
+            + self.salts[salt_index] * now.day
+            - self.salts[salt_index - 1]
+        )
+
+    # ========================================================
+    # POST
+    # ========================================================
+
+    def post(self, path, body=None):
+
+        url = self.build_url(path)
+
+        if body is None:
+
+            if (
+                "/nepse-data/floorsheet" in path
+                or "/nepse-data/today-price" in path
+            ):
+
+                payload_id = (
+                    self.get_floor_payload_id()
+                )
+
+            elif "/graph/index/" in path:
+
+                payload_id = (
+                    self.get_index_payload_id()
+                )
+
+            else:
+
+                payload_id = (
+                    self.get_post_payload_id()
+                )
+
+            body = {
+                "id": payload_id
+            }
+
+        headers = {
+            **self.get_headers(),
+            "Content-Type": "application/json",
+        }
+
+        response = session.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=30
+        )
+
+        if response.status_code == 401:
+
+            self.reset_token()
+
+            headers = {
+                **self.get_headers(),
+                "Content-Type": "application/json",
+            }
+
+            response = session.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=30
+            )
+
+        return (
+            response.text,
+            response.status_code
+        )
+
 
 # ============================================================
-# SINGLE NEPSE INSTANCE
+# SINGLE CLIENT INSTANCE
 # ============================================================
 
 nepse = Nepse()
 
 
 # ============================================================
-# HTTP SERVER
+# JSON HELPER
+# ============================================================
+
+def parse_json(text):
+
+    try:
+        return json.loads(text)
+
+    except Exception:
+
+        return {
+            "raw": text
+        }
+
+
+# ============================================================
+# NORMALIZE STOCK
+# ============================================================
+
+def normalize_stock(stock):
+
+    if not isinstance(stock, dict):
+        return stock
+
+    return {
+        "symbol": stock.get("symbol"),
+
+        "securityName": (
+            stock.get("securityName")
+            or stock.get("companyName")
+            or stock.get("securityNameNepali")
+        ),
+
+        "ltp": (
+            stock.get("lastTradedPrice")
+            or stock.get("ltp")
+        ),
+
+        "open": (
+            stock.get("openPrice")
+            or stock.get("open")
+        ),
+
+        "high": (
+            stock.get("highPrice")
+            or stock.get("high")
+        ),
+
+        "low": (
+            stock.get("lowPrice")
+            or stock.get("low")
+        ),
+
+        "previousClose": (
+            stock.get("previousClose")
+            or stock.get("previousClosingPrice")
+        ),
+
+        "change": (
+            stock.get("change")
+            or stock.get("difference")
+        ),
+
+        "percentageChange": (
+            stock.get("percentageChange")
+            or stock.get("percentChange")
+        ),
+
+        "volume": (
+            stock.get("totalTradeQuantity")
+            or stock.get("volume")
+        ),
+
+        "turnover": (
+            stock.get("totalTradeValue")
+            or stock.get("turnover")
+        ),
+
+        "trades": (
+            stock.get("totalTrades")
+            or stock.get("numberOfTrades")
+        ),
+
+        "timestamp": (
+            datetime.datetime.now(TZ_NP)
+            .isoformat()
+        )
+    }
+
+
+# ============================================================
+# HTTP HANDLER
 # ============================================================
 
 class Handler(BaseHTTPRequestHandler):
 
-    def send_json(self, body, status=200):
+    # --------------------------------------------------------
+    # CORS
+    # --------------------------------------------------------
 
-        self.send_response(status)
-
-        self.send_header(
-            "Content-Type",
-            "application/json"
-        )
+    def cors(self):
 
         self.send_header(
             "Access-Control-Allow-Origin",
@@ -423,62 +621,292 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Type, Authorization"
         )
 
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
+    def response(self, data, status=200):
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
+
+        self.cors()
+
         self.end_headers()
 
-        if isinstance(body, str):
-            self.wfile.write(body.encode("utf-8"))
-        else:
-            self.wfile.write(
-                json.dumps(body).encode("utf-8")
-            )
+        self.wfile.write(
+            json.dumps(
+                data,
+                ensure_ascii=False
+            ).encode("utf-8")
+        )
+
+    # --------------------------------------------------------
+    # OPTIONS
+    # --------------------------------------------------------
 
     def do_OPTIONS(self):
 
-        self.send_json({}, 200)
+        self.response({}, 200)
+
+    # --------------------------------------------------------
+    # GET
+    # --------------------------------------------------------
 
     def do_GET(self):
 
-        if self.path == "/":
+        parsed = urlparse(self.path)
 
-            self.send_json({
-                "name": "Open NEPSE API",
-                "status": "running",
-                "source": "Nepal Stock Exchange",
-            })
+        path = parsed.path
 
-            return
+        print("GET", self.path)
 
         try:
 
-            path = self.path
+            # ==================================================
+            # API HOME
+            # ==================================================
 
-            print("GET:", path)
+            if path == "/":
 
-            body, status = nepse.get(path)
+                self.response({
+                    "name": "Open NEPSE API",
+                    "status": "running",
+                    "timezone": "Asia/Kathmandu",
+                    "endpoints": [
+                        "/api/stocks",
+                        "/api/stocks/SYMBOL",
+                        "/api/market",
+                        "/api/index",
+                        "/api/status",
+                        "/api/gainers",
+                        "/api/losers"
+                    ]
+                })
 
-            self.send_json(
-                json.loads(body)
-                if body
-                else {},
-                status
-            )
+                return
+
+            # ==================================================
+            # STOCKS
+            # ==================================================
+
+            if path == "/api/stocks":
+
+                # Today's price is a protected POST endpoint.
+                body, status = nepse.post(
+                    "/nepse-data/today-price"
+                )
+
+                data = parse_json(body)
+
+                if isinstance(data, list):
+
+                    data = [
+                        normalize_stock(stock)
+                        for stock in data
+                    ]
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "count": (
+                            len(data)
+                            if isinstance(data, list)
+                            else 0
+                        ),
+                        "data": data
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # SINGLE STOCK
+            # ==================================================
+
+            if path.startswith("/api/stocks/"):
+
+                symbol = path.split("/")[-1].upper()
+
+                body, status = nepse.get(
+                    f"/security/{symbol}"
+                )
+
+                data = parse_json(body)
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "symbol": symbol,
+                        "data": data
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # MARKET SUMMARY
+            # ==================================================
+
+            if path == "/api/market":
+
+                body, status = nepse.get(
+                    "/market-summary"
+                )
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": parse_json(body)
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # NEPSE INDEX
+            # ==================================================
+
+            if path == "/api/index":
+
+                body, status = nepse.get(
+                    "/nepse-index"
+                )
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": parse_json(body)
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # MARKET STATUS
+            # ==================================================
+
+            if path == "/api/status":
+
+                body, status = nepse.get(
+                    "/nepse-data/market-open"
+                )
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": parse_json(body)
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # GAINERS
+            # ==================================================
+
+            if path == "/api/gainers":
+
+                body, status = nepse.get(
+                    "/top-ten/top-gainer?all=true"
+                )
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": parse_json(body)
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # LOSERS
+            # ==================================================
+
+            if path == "/api/losers":
+
+                body, status = nepse.get(
+                    "/top-ten/top-loser?all=true"
+                )
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": parse_json(body)
+                    },
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # ORIGINAL NEPSE PROXY
+            # ==================================================
+
+            if path.startswith("/nepse/"):
+
+                nepse_path = path.replace(
+                    "/nepse/",
+                    "/",
+                    1
+                )
+
+                body, status = nepse.get(
+                    nepse_path
+                )
+
+                self.response(
+                    parse_json(body),
+                    status
+                )
+
+                return
+
+            # ==================================================
+            # NOT FOUND
+            # ==================================================
+
+            self.response({
+                "success": False,
+                "error": "Endpoint not found"
+            }, 404)
 
         except Exception as error:
 
-            print("GET ERROR:", error)
+            print(
+                "GET ERROR:",
+                repr(error)
+            )
 
-            self.send_json({
+            self.response({
                 "success": False,
                 "error": str(error)
             }, 500)
 
+    # --------------------------------------------------------
+    # POST
+    # --------------------------------------------------------
+
     def do_POST(self):
 
+        parsed = urlparse(self.path)
+
+        path = parsed.path
+
+        print("POST", self.path)
+
         try:
-
-            path = self.path
-
-            print("POST:", path)
 
             content_length = int(
                 self.headers.get(
@@ -494,62 +922,116 @@ class Handler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(
                     content_length
                 ).decode("utf-8")
-
+                
                 if raw.strip():
 
-                    try:
-                        body = json.loads(raw)
+                    body = json.loads(raw)
 
-                    except json.JSONDecodeError:
+            # ------------------------------------------------
+            # Today price
+            # ------------------------------------------------
 
-                        parsed = parse_qs(raw)
+            if path == "/api/today-price":
 
-                        body = {
-                            key: value[0]
-                            for key, value
-                            in parsed.items()
-                        }
+                response, status = nepse.post(
+                    "/nepse-data/today-price",
+                    body
+                )
 
-            response, status = nepse.post(
-                path,
-                body
-            )
+                data = parse_json(response)
 
-            self.send_json(
-                json.loads(response)
-                if response
-                else {},
-                status
-            )
+                if isinstance(data, list):
+
+                    data = [
+                        normalize_stock(stock)
+                        for stock in data
+                    ]
+
+                self.response(
+                    {
+                        "success": status == 200,
+                        "data": data
+                    },
+                    status
+                )
+
+                return
+
+            # ------------------------------------------------
+            # Floor sheet
+            # ------------------------------------------------
+
+            if path == "/api/floorsheet":
+
+                response, status = nepse.post(
+                    "/nepse-data/floorsheet",
+                    body
+                )
+
+                self.response(
+                    parse_json(response),
+                    status
+                )
+
+                return
+
+            self.response({
+                "success": False,
+                "error": "POST endpoint not found"
+            }, 404)
 
         except Exception as error:
 
-            print("POST ERROR:", error)
+            print(
+                "POST ERROR:",
+                repr(error)
+            )
 
-            self.send_json({
+            self.response({
                 "success": False,
                 "error": str(error)
             }, 500)
 
 
 # ============================================================
-# START
+# SERVER
 # ============================================================
 
-def run():
+def main():
 
     server = ThreadingHTTPServer(
         ("0.0.0.0", PORT),
         Handler
     )
 
+    print()
+    print("==========================================")
+    print("        OPEN NEPSE API")
+    print("==========================================")
+    print()
     print(
-        f"NEPSE API running on "
-        f"http://localhost:{PORT}"
+        f"Server: http://localhost:{PORT}"
     )
+    print()
+    print(
+        f"Stocks: http://localhost:{PORT}/api/stocks"
+    )
+    print(
+        f"Market: http://localhost:{PORT}/api/market"
+    )
+    print(
+        f"Index:  http://localhost:{PORT}/api/index"
+    )
+    print(
+        f"Status: http://localhost:{PORT}/api/status"
+    )
+    print()
+    print("Press CTRL+C to stop.")
+    print("==========================================")
+    print()
 
     server.serve_forever()
 
 
 if __name__ == "__main__":
-    run()
+    main()
