@@ -29,7 +29,7 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 
-# Use a larger page size to reduce the number of requests
+# NEPSE seems to ignore size and returns 20 per page, but we keep it for compatibility
 NEPSE_PAGE_SIZE = 100
 MAX_STOCK_PAGES = 100   # safety limit
 STOCK_CACHE_TTL = 60
@@ -384,7 +384,11 @@ class Nepse:
         return response.text, response.status_code
 
     # ---------- Fetch one page ----------
-    def get_stock_page(self, page=0, size=100):
+    def get_stock_page(self, page=0, size=20):
+        """
+        Fetch one page from NEPSE today-price.
+        Note: NEPSE may ignore the `size` parameter and always return 20.
+        """
         payload_id = self.get_floor_payload_id()
         body, status = self.post(
             "/nepse-data/today-price",
@@ -398,10 +402,10 @@ class Nepse:
         return data
 
     # ---------- Fetch all pages (robust while loop) ----------
-    def fetch_all_pages(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
+    def fetch_all_pages(self, page_size=20, force_refresh=False):
         """
-        Fetch every page of stocks from NEPSE using a simple while loop.
-        Stops when a page contains fewer items than page_size or is empty.
+        Fetch every page of stocks from NEPSE.
+        Continues fetching until an empty page is returned.
         """
         with self._cache_lock:
             if not force_refresh and self._stock_cache is not None:
@@ -422,7 +426,6 @@ class Nepse:
             print(f"Fetching NEPSE stock page {page} (size={page_size})...")
             data = self.get_stock_page(page=page, size=page_size)
 
-            # Store first page for debugging
             if page == 0:
                 raw_first_page = data
 
@@ -439,8 +442,8 @@ class Nepse:
 
             print(f"  Page {page}: {len(content)} items")
 
+            # If the page is empty, we've reached the end
             if not content:
-                # Empty page – we've reached the end
                 break
 
             # Add stocks to dedup map
@@ -450,11 +453,6 @@ class Nepse:
                     stock_map[sym] = stock
                 else:
                     all_stocks.append(stock)  # fallback
-
-            # If we got fewer items than requested, this is the last page
-            if len(content) < page_size:
-                print(f"  Page {page} has fewer than {page_size} items – assuming last page.")
-                break
 
             page += 1
 
@@ -475,7 +473,7 @@ class Nepse:
             "total_fetched": len(final_stocks)
         }
 
-    def get_all_stocks(self, page_size=NEPSE_PAGE_SIZE, force_refresh=False):
+    def get_all_stocks(self, page_size=20, force_refresh=False):
         result = self.fetch_all_pages(page_size, force_refresh)
         return result["stocks"]
 
@@ -590,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": False, "error": "size must be between 1 and 100"}, 400)
                     return
 
-                all_stocks = nepse.get_all_stocks(page_size=100)
+                all_stocks = nepse.get_all_stocks(page_size=20)  # NEPSE uses 20 per page
                 matches = [s for s in all_stocks if stock_matches_query(s, q)]
                 total = len(matches)
                 start = page * size
@@ -637,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.response({"success": True, "page": page, "size": size, "data": data})
                     return
 
-                all_stocks = nepse.get_all_stocks(page_size=100)
+                all_stocks = nepse.get_all_stocks(page_size=20)
                 matches = []
                 for s in all_stocks:
                     sym = str(extract_symbol(s) or "").lower()
