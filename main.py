@@ -29,6 +29,7 @@ WASM_FILE = BASE_DIR / "css.wasm"
 
 REQUEST_TIMEOUT = (10, 30)
 STOCK_CACHE_TTL = 60
+PRICE_CACHE_TTL = 60  # Cache price data for 60 seconds
 
 
 # ============================================================
@@ -94,31 +95,51 @@ def extract_security_id(stock):
     return first_present(stock, "securityId", "id", "security_id")
 
 
-def normalize_stock(stock):
+def normalize_stock(stock, price_data=None):
     """
-    Normalize a stock record. If it's from the /security endpoint,
-    only symbol, securityName, and securityId are available.
+    Normalize a stock record. If price_data (from /security/{symbol}) is provided,
+    merge its fields (open, high, low, ltp, etc.) into the result.
     """
     if not isinstance(stock, dict):
         return stock
 
-    # Try to get price fields if they exist (from /today-price)
-    return {
+    result = {
         "symbol": extract_symbol(stock),
         "securityName": extract_security_name(stock),
         "securityId": extract_security_id(stock),
-        "ltp": first_present(stock, "lastTradedPrice", "ltp", "lastTradedPrice"),
-        "open": first_present(stock, "openPrice", "open"),
-        "high": first_present(stock, "highPrice", "high"),
-        "low": first_present(stock, "lowPrice", "low"),
-        "previousClose": first_present(stock, "previousClose", "previousClosingPrice"),
-        "change": first_present(stock, "change", "difference"),
-        "percentageChange": first_present(stock, "percentageChange", "percentChange"),
-        "volume": first_present(stock, "totalTradeQuantity", "volume", "totalTradedQuantity"),
-        "turnover": first_present(stock, "totalTradeValue", "turnover"),
-        "trades": first_present(stock, "totalTrades", "numberOfTrades"),
+        "ltp": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "previousClose": None,
+        "change": None,
+        "percentageChange": None,
+        "volume": None,
+        "turnover": None,
+        "trades": None,
         "timestamp": now_np().isoformat(),
     }
+
+    # If price_data is provided, extract fields from securityDailyTradeDto
+    if price_data and isinstance(price_data, dict):
+        dto = price_data.get("securityDailyTradeDto") or {}
+        result.update({
+            "ltp": first_present(dto, "lastTradedPrice", "ltp"),
+            "open": first_present(dto, "openPrice", "open"),
+            "high": first_present(dto, "highPrice", "high"),
+            "low": first_present(dto, "lowPrice", "low"),
+            "previousClose": first_present(dto, "previousClose", "previousClosingPrice"),
+            "change": first_present(dto, "change", "difference"),
+            "percentageChange": first_present(dto, "percentageChange", "percentChange"),
+            "volume": first_present(dto, "totalTradeQuantity", "volume", "totalTradedQuantity"),
+            "turnover": first_present(dto, "totalTradeValue", "turnover"),
+            "trades": first_present(dto, "totalTrades", "numberOfTrades"),
+        })
+        # Also update timestamp if available
+        if "lastUpdatedDateTime" in dto:
+            result["timestamp"] = dto["lastUpdatedDateTime"]
+
+    return result
 
 
 def stock_matches_query(stock, query):
@@ -221,9 +242,10 @@ class Nepse:
         self.payload_id = None
         self.lock = threading.RLock()
 
-        # Cache for the full security list
+        # Caches
         self._security_cache = None
         self._security_cache_time = None
+        self._price_cache = {}  # symbol -> (data, timestamp)
         self._cache_lock = threading.RLock()
 
     # ---------- Authentication ----------
@@ -380,10 +402,6 @@ class Nepse:
 
     # ---------- Fetch all securities (using /security endpoint) ----------
     def fetch_all_securities(self, force_refresh=False):
-        """
-        Fetch the full list of securities from /security (GET).
-        This endpoint returns all securities without pagination.
-        """
         with self._cache_lock:
             if not force_refresh and self._security_cache is not None:
                 if time.time() - self._security_cache_time < STOCK_CACHE_TTL:
@@ -397,7 +415,6 @@ class Nepse:
 
         data = json_or_raw(body)
         if not isinstance(data, list):
-            # Sometimes the response might be wrapped in a 'content' or 'data' field
             if isinstance(data, dict):
                 data = data.get("content") or data.get("data") or data.get("items")
                 if not isinstance(data, list):
@@ -407,27 +424,49 @@ class Nepse:
 
         print(f"Fetched {len(data)} securities.")
 
-        # Cache
         with self._cache_lock:
             self._security_cache = data
             self._security_cache_time = time.time()
 
         return data
 
+    # ---------- Fetch price data for a specific symbol ----------
+    def get_price_for_symbol(self, symbol, force_refresh=False):
+        """
+        Fetch detailed price data for a given symbol using /security/{symbol}.
+        Returns the parsed JSON, or None if not found.
+        """
+        # Check cache
+        cache_key = symbol.upper()
+        with self._cache_lock:
+            if not force_refresh and cache_key in self._price_cache:
+                cached_data, cached_time = self._price_cache[cache_key]
+                if time.time() - cached_time < PRICE_CACHE_TTL:
+                    print(f"Using cached price for {symbol}")
+                    return cached_data
+
+        print(f"Fetching price for {symbol}...")
+        body, status = self.get(f"/security/{symbol}")
+        if status != 200:
+            print(f"Could not fetch price for {symbol}. HTTP {status}")
+            return None
+
+        data = json_or_raw(body)
+        if not isinstance(data, dict):
+            return None
+
+        # Cache it
+        with self._cache_lock:
+            self._price_cache[cache_key] = (data, time.time())
+
+        return data
+
     # ---------- Public method to get all stocks (for search) ----------
     def get_all_stocks(self, force_refresh=False):
-        """
-        Returns the full list of securities.
-        This is used for the search endpoint.
-        """
         return self.fetch_all_securities(force_refresh)
 
     # ---------- Existing methods for other endpoints ----------
     def get_stock_page(self, page=0, size=20):
-        """
-        Fetch one page from today-price (for /api/stocks).
-        Note: pagination may not work; we keep it for compatibility.
-        """
         payload_id = self.get_floor_payload_id()
         body, status = self.post(
             "/nepse-data/today-price",
@@ -541,6 +580,15 @@ class Handler(BaseHTTPRequestHandler):
                 paginated = matches[start:end]
                 total_pages = (total + size - 1) // size if total > 0 else 0
 
+                # Enrich each matched stock with price data (only for the paginated subset)
+                enriched_data = []
+                for stock in paginated:
+                    symbol = extract_symbol(stock)
+                    price_data = None
+                    if symbol:
+                        price_data = nepse.get_price_for_symbol(symbol)
+                    enriched_data.append(normalize_stock(stock, price_data))
+
                 self.response({
                     "success": True,
                     "query": q,
@@ -550,8 +598,8 @@ class Handler(BaseHTTPRequestHandler):
                     "totalPages": total_pages,
                     "hasNext": page + 1 < total_pages,
                     "hasPrevious": page > 0,
-                    "count": len(paginated),
-                    "data": [normalize_stock(s) for s in paginated],
+                    "count": len(enriched_data),
+                    "data": enriched_data,
                 })
                 return
 
@@ -571,20 +619,15 @@ class Handler(BaseHTTPRequestHandler):
                 symbol = query.get("symbol", [""])[0].strip()
                 security_name = query.get("securityName", [""])[0].strip()
 
-                # If no filter, use the today-price endpoint (paginated, but may not work)
                 if not symbol and not security_name:
-                    try:
-                        data = nepse.get_stock_page(page=page, size=size)
-                        if isinstance(data, dict):
-                            content = data.get("content") or data.get("data") or []
-                            if isinstance(content, list):
-                                data["content"] = [normalize_stock(s) for s in content]
-                        self.response({"success": True, "page": page, "size": size, "data": data})
-                    except Exception as e:
-                        self.response({"success": False, "error": str(e)}, 500)
+                    data = nepse.get_stock_page(page=page, size=size)
+                    if isinstance(data, dict):
+                        content = data.get("content") or data.get("data") or []
+                        if isinstance(content, list):
+                            data["content"] = [normalize_stock(s) for s in content]
+                    self.response({"success": True, "page": page, "size": size, "data": data})
                     return
 
-                # If filter is present, search the full security list
                 all_stocks = nepse.get_all_stocks()
                 matches = []
                 for s in all_stocks:
@@ -602,6 +645,15 @@ class Handler(BaseHTTPRequestHandler):
                 paginated = matches[start:end]
                 total_pages = (total + size - 1) // size if total > 0 else 0
 
+                # Enrich with price data
+                enriched_data = []
+                for stock in paginated:
+                    sym = extract_symbol(stock)
+                    price_data = None
+                    if sym:
+                        price_data = nepse.get_price_for_symbol(sym)
+                    enriched_data.append(normalize_stock(stock, price_data))
+
                 self.response({
                     "success": True,
                     "page": page,
@@ -610,8 +662,8 @@ class Handler(BaseHTTPRequestHandler):
                     "totalPages": total_pages,
                     "hasNext": page + 1 < total_pages,
                     "hasPrevious": page > 0,
-                    "count": len(paginated),
-                    "data": [normalize_stock(s) for s in paginated],
+                    "count": len(enriched_data),
+                    "data": enriched_data,
                 })
                 return
 
