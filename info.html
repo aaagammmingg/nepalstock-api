@@ -1,0 +1,253 @@
+<title>Welcome to NEPSE Website API !!!</title>
+<h2>Welcome to <a href="https://nepalstock.com/api/">NEPSE Website API</a> !!!</h2>
+<style>
+    a {
+        text-decoration: none;
+    }
+
+    a:visited {
+        text-decoration: none;
+    }
+
+    form {
+        display: none;
+    }
+</style>
+<script>
+
+    function newo(e) {
+        var ins = document.getElementById(e)
+
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", ins.action, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState == XMLHttpRequest.DONE) {
+                var win = window.open();
+                win.document.body.innerHTML = xhr.responseText;
+            }
+        }
+        var pdata = ins.getElementsByTagName("input")[0].value;
+        if (pdata != '==') {
+            xhr.send(atob(pdata));
+        } else {
+            xhr.send();
+        }
+
+    }
+</script>
+<ul>
+    <li>NEPSE Subindices -> <a target="blank" href="/
+">/
+        </a></li>
+    <li>Securities Listing -> <a target="blank" href="/security?nonDelisted=true
+">/security?nonDelisted=true
+        </a></li>
+    <li>Market Status -> <a target="blank" href="/nepse-data/market-open
+">/nepse-data/market-open
+        </a></li>
+    <li>Daily Trade Stat [price-volume]-> <a target="blank" href="/securityDailyTradeStat/58
+">/securityDailyTradeStat/58
+        </a></li>
+    <li>Corporate Diclosures -> <a target="blank" href="/news/companies/disclosure
+">/news/companies/disclosure
+        </a></li>
+    <li>Graph Data</li>
+    <ul>
+        <li>index graph</li>
+        <ul>
+            <li>nepse -> <a onclick="newo('1')" href="javascript:void(0);">/graph/index/58</a>, [POST Request]
+            </li>
+            <form id="1" action="/graph/index/58" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>sensitive -> <a onclick="newo('2')" href="javascript:void(0);">/graph/index/57</a>, [POST Request]
+            </li>
+            <form id="2" action="/graph/index/57" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>float -> <a onclick="newo('3')" href="javascript:void(0);">/graph/index/62</a>, [POST Request]
+            </li>
+            <form id="3" action="/graph/index/62" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>sensitive_float -> <a onclick="newo('4')" href="javascript:void(0);">/graph/index/63</a>, [POST Request]
+            </li>
+            <form id="4" action="/graph/index/63" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+        </ul>
+        <li>sub index graph</li>
+        <ul>
+            <li>banking -> <a onclick="newo('5')" href="javascript:void(0);">/graph/index/51</a>, [POST Request]
+            </li>
+            <form id="5" action="/graph/index/51" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>development_bank -> <a onclick="newo('6')" href="javascript:void(0);">/graph/index/55</a>, [POST
+                Request]
+            </li>
+            <form id="6" action="/graph/index/55" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>finance -> <a onclick="newo('7')" href="javascript:void(0);">/graph/index/60</a>, [POST Request]
+            </li>
+            <form id="7" action="/graph/index/60" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>hotel_tourism -> <a onclick="newo('8')" href="javascript:void(0);">/graph/index/52</a>, [POST Request]
+            </li>
+            <form id="8" action="/graph/index/52" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>hydro -> <a onclick="newo('9')" href="javascript:void(0);">/graph/index/54</a>, [POST Request]
+            </li>
+            <form id="9" action="/graph/index/54" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>investment -> <a onclick="newo('10')" href="javascript:void(0);">/graph/index/67</a>, [POST Request]
+            </li>
+            <form id="10" action="/graph/index/67" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>life_insurance -> <a onclick="newo('11')" href="javascript:void(0);">/graph/index/65</a>, [POST Request]
+            </li>
+            <form id="11" action="/graph/index/65" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>manufacturing -> <a onclick="newo('12')" href="javascript:void(0);">/graph/index/56</a>, [POST Request]
+            </li>
+            <form id="12" action="/graph/index/56" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>microfinance -> <a onclick="newo('13')" href="javascript:void(0);">/graph/index/64</a>, [POST Request]
+            </li>
+            <form id="13" action="/graph/index/64" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>mutual_fund -> <a onclick="newo('14')" href="javascript:void(0);">/graph/index/66</a>, [POST Request]
+            </li>
+            <form id="14" action="/graph/index/66" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>non_life_insurance -> <a onclick="newo('15')" href="javascript:void(0);">/graph/index/59</a>, [POST
+                Request]
+            </li>
+            <form id="15" action="/graph/index/59" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>trading -> <a onclick="newo('17')" href="javascript:void(0);">/graph/index/61</a>, [POST Request]
+            </li>
+            <form id="17" action="/graph/index/61" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+            <li>others -> <a onclick="newo('16')" href="javascript:void(0);">/graph/index/53</a>, [POST Request]
+            </li>
+            <form id="16" action="/graph/index/53" method="POST" target="_blank"><input type="hidden" name="whatever"
+                    value="=="></form>
+            </a></li>
+        </ul>
+    </ul>
+    <li>company</li>
+    <ul>
+        <li>List -> <a target="blank" href="/company/list
+">/company/list
+            </a></li>
+        <li>Classification -> <a target="blank" href=" /security/classification
+"> /security/classification
+            </a></li>
+        <li>Graph Data -> <a onclick="newo('18')" href="javascript:void(0);">/market/graphdata/131</a>, [POST Request]
+        </li>
+        <form id="18" action="/market/graphdata/131" method="POST" target="_blank"><input type="hidden" name="whatever"
+                value="=="></form>
+        <li>Detail -> <a target="blank" href="/security/8045
+">/security/8045</a></li>
+        <li>price_volume_history -> <a target="blank" href="/market/security/price/8045
+">/market/security/price/8045</a></li>
+        <li>Stock Trading -> <a target="blank" href="/market/history/security/2790?&size=500&startDate=2021-08-23&endDate=2022-08-23
+">/market/history/security/2790?&size=500&startDate=2021-08-23&endDate=2022-08-23
+            </a></li>
+        <li>floorsheet -> <a onclick="newo('19')" href="javascript:void(0);">/security/floorsheet/8045</a>, [POST
+            Request]
+        </li>
+        <form id="19" action="/security/floorsheet/8045" method="POST" target="_blank"><input type="hidden"
+                name="whatever" value="=="></form>
+    </ul>
+
+    <li>Market Summary -> <a target="blank" href="/market-summary
+">/market-summary</a></li>
+    <li>Market History -> <a target="blank" href="/market-summary-history
+">/market-summary-history
+        </a></li>
+    <li>Market Capitilization by Date -> <a target="blank" href="/nepse-data/marcapbydate/
+">/nepse-data/marcapbydate/
+        </a></li>
+    <li>Supply Demand -> <a target="blank" href="/nepse-data/supplydemand
+">/nepse-data/supplydemand
+        </a></li>
+    <li>Top Gainers -> <a target="blank" href="/top-ten/top-gainer?all=true
+">/top-ten/top-gainer?all=true
+        </a></li>
+    <li>Top Losers -> <a target="blank" href="/top-ten/top-loser?all=true
+">/top-ten/top-loser?all=true
+        </a></li>
+    <li>Top Turnover -> <a target="blank" href="/top-ten/turnover?all=true
+">/top-ten/turnover?all=true
+        </a></li>
+    <li>Top Volume -> <a target="blank" href="/top-ten/trade?all=true
+">/top-ten/trade?all=true
+        </a></li>
+    <li>Top Transaction -> <a target="blank" href="/top-ten/transaction?all=true
+">/top-ten/transaction?all=true
+        </a></li>
+    <li>Nepse Index -> <a target="blank" href="/nepse-index
+">/nepse-index
+        </a></li>
+    <li><b><u>FloorSheet</u></b> -> <a onclick="newo('20')"
+            href="javascript:void(0);">/nepse-data/floorsheet?page=0&size=500&sort=contractId,desc</a>, [POST Request]
+    </li>
+    <form id="20" action="/nepse-data/floorsheet?page=0&size=500&sort=contractId,desc" method="POST" target="_blank">
+        <input type="hidden" name="whatever" value="=="></form>
+    <li>Indexes -> <a target="blank" href="/index
+">/index
+        </a></li>
+    <li>Indices -> <a target="blank" href="/index/history/58?
+">/index/history/58?
+        </a></li>
+    <li>N days trading average price -> <a target="blank" href="/nepse-data/trading-average?nDays=120
+">/nepse-data/trading-average?nDays=120
+        </a></li>
+    <li>Today's Price -> <a onclick="newo('21')" href="javascript:void(0);">/nepse-data/today-price</a>, [POST Request]
+    </li>
+    <form id="21" action="/nepse-data/today-price" method="POST" target="_blank"><input type="hidden" name="whatever"
+            value="=="></form>
+    <li>Sectorwise Options -> <a target="blank" href="/sectorwise
+">/sectorwise
+        </a></li>
+    <li>Sectorwise Details -> <a target="blank" href="/sectorwise?businessDate=2022-08-08
+">/sectorwise?businessDate=2022-08-08
+        </a></li>
+
+    <li>Broker List -> <a onclick="newo('22')" href="javascript:void(0);">/member?&size=500</a>, POST Data Required:
+        <code>{"memberName":"","contactPerson":"","contactNumber":"","memberCode":"","provinceId":0,"districtId":0,"municipalityId":0,"isDealer":"Y"}</code>
+    </li>
+    <form id="22" action="/member?&size=500" method="POST" target="_blank"><input type="hidden" name="whatever"
+            value="eyJtZW1iZXJOYW1lIjoiIiwiY29udGFjdFBlcnNvbiI6IiIsImNvbnRhY3ROdW1iZXIiOiIiLCJtZW1iZXJDb2RlIjoiIiwicHJvdmluY2VJZCI6MCwiZGlzdHJpY3RJZCI6MCwibXVuaWNpcGFsaXR5SWQiOjAsImlzRGVhbGVyIjoiWSJ9">
+    </form>
+
+    <li>Stock Dealers -> <a onclick="newo('23')" href="javascript:void(0);">/member/dealer?&size=500</a>, POST Data
+        Required:
+        <code>{"memberName":"","contactPerson":"","contactNumber":"","memberCode":"","provinceId":0,"districtId":0,"municipalityId":0,"isDealer":"Y"}</code>
+    </li>
+    <form id="23" action="/member/dealer?&size=500" method="POST" target="_blank"><input type="hidden" name="whatever"
+            value="eyJtZW1iZXJOYW1lIjoiIiwiY29udGFjdFBlcnNvbiI6IiIsImNvbnRhY3ROdW1iZXIiOiIiLCJtZW1iZXJDb2RlIjoiIiwicHJvdmluY2VJZCI6MCwiZGlzdHJpY3RJZCI6MCwibXVuaWNpcGFsaXR5SWQiOjAsImlzRGVhbGVyIjoiWSJ9">
+    </form>
+
+    <li>Promoter Share -> <a target="blank" href="/security/promoters
+">/security/promoters
+        </a></li>
+    <li>Holyday Options -> <a target="blank" href="/holiday/year
+">/holiday/year
+        </a></li>
+    <li>Holiday by Year -> <a target="blank" href="/holiday/list?year=2022">/holiday/list?year=2022</a></li>
+</ul>

@@ -1,0 +1,11 @@
+services:
+- type: web
+  repo: https://github.com/biplap12/nepalstock-api.git
+  name: nepalstock-api
+  plan: free
+  branch: main
+  rootDir: .
+  region: singapore
+  env: python
+  buildCommand: pip install -r requirements.txt
+  startCommand: python main.py

@@ -1,0 +1,7 @@
+certifi
+charset-normalizer
+idna
+pytz
+pywasm
+requests
+urllib3
