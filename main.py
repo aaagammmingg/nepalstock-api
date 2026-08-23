@@ -1044,7 +1044,7 @@ import os
 import threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pywasm
 import pytz
