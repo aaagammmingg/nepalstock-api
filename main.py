@@ -384,7 +384,7 @@ class Nepse:
         return response.text, response.status_code
 
     # ---------- Fetch one page ----------
-    def get_stock_page(self, page=0, size=20):
+    def get_stock_page(self, page=0, size=100):
         """
         Fetch one page from NEPSE today-price.
         Note: NEPSE may ignore the `size` parameter and always return 20.
